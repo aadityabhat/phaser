@@ -27,6 +27,14 @@ from ..common.strain import strain_perturbation
 
 logger = logging.getLogger(__name__)
 _PER_ITER_VARS: t.FrozenSet[ReconsVar] = frozenset({'positions', 'tilt', 'distortion'})
+# Reference pixel count for the npix gradient normalization below. CuPy's reference
+# implementation (gradcalc.py) bakes similar magic constants (256, 32, 4, ...) around
+# its own step-size conventions purely to keep gradients in a convenient numeric range;
+# this plays the same role. Chosen to match the `sim_shape` phaser's tuned learning
+# rates have so far been tuned around (see recon2/r2a.yaml), so npix normalization is a
+# no-op (factor of 1) at that baseline and only rescales gradients when `sim_shape`
+# actually changes -- existing learning rates don't need to be re-derived from scratch.
+_NPIX_REFERENCE: int = 192 * 192
 
 
 def process_solvers(
@@ -137,6 +145,31 @@ def filter_vars(d: t.Dict[ReconsVar, t.Any], vars: t.AbstractSet[ReconsVar]) -> 
     return {k: v for (k, v) in d.items() if k in vars}
 
 
+def compute_scan_density(state: ReconsState, xp: t.Any, dtype: t.Type[numpy.floating]) -> t.Any:
+    """Characteristic real-space scan-position density, used to make the object
+    gradient invariant to scan step size.
+
+    Mirrors the CuPy reference implementation's `ow`/`ow_scalar` (see
+    `python/ptycho/gradcalc.py`): scatter-add a 1 for every object pixel each
+    probe footprint covers, across the *whole* scan, then reduce the resulting
+    per-pixel coverage-count grid to a scalar via sum(x^2)/sum(x) (the same
+    'characteristic value' reduction CuPy's `invavg` uses for step-size
+    normalization elsewhere). Counting actual footprint overlap (rather than
+    assuming a rectangular grid step) is what makes this generalize to
+    non-rectangular/non-uniform scans.
+
+    Computed once, from the initial scan, and treated as a fixed normalization
+    constant for the whole run -- the same convention already used for
+    `probe_int` below, and reasonable since position updates are small
+    perturbations relative to the sampling scale.
+    """
+    probe_shape = state.probe.data.shape[-2:]
+    coverage = xp.zeros(tuple(int(s) for s in state.object.sampling.shape), dtype=dtype)
+    ones_footprint = xp.ones((state.scan.shape[0], *probe_shape), dtype=dtype)
+    coverage = state.object.sampling.add_view_at_pos(coverage, state.scan, ones_footprint)
+    return xp.sum(coverage**2) / xp.sum(coverage)
+
+
 @tree.tree_dataclass
 class SolverStates:
     noise_model_state: t.Any
@@ -237,6 +270,7 @@ def run_engine(args: EngineArgs, props: GradientEnginePlan) -> ReconsState:
     logger.info(f"Rescaling initial probe intensity by {float(rescale_factor):.2e}")
     state.probe.data *= xp.sqrt(rescale_factor)
     probe_int = xp.sum(abs2(state.probe.data))
+    scan_density = compute_scan_density(state, xp, dtype)
 
     observer.start_engine(state)
 
@@ -304,6 +338,7 @@ def run_engine(args: EngineArgs, props: GradientEnginePlan) -> ReconsState:
                 group_patterns=group_patterns, #load_group(group),
                 pattern_mask=pattern_mask,
                 probe_int=probe_int,
+                scan_density=scan_density,
                 xp=xp, dtype=dtype,
                 jit_unroll_slices=jit_unroll_slices,
             )
@@ -384,6 +419,7 @@ def run_group(
     group_patterns: NDArray[numpy.floating],
     pattern_mask: NDArray[numpy.floating],
     probe_int: t.Union[float, numpy.floating],
+    scan_density: t.Union[float, numpy.floating],
     xp: t.Any,
     dtype: t.Type[numpy.floating],
     jit_unroll_slices: t.Union[int, bool],
@@ -396,12 +432,23 @@ def run_group(
         noise_model=noise_model, regularizers=regularizers, solver_states=solver_states,
         xp=xp, dtype=dtype, jit_unroll_slices=jit_unroll_slices
     )
+    # scale gradients appropriately (mirrors CuPy reference's gradcalc.py normalization,
+    # applied uniformly here so every solver -- Adam, SGD, strain distortion, etc. --
+    # consumes an already-normalized gradient):
+    #  - per-pattern variables are normalized by the grouping `group.shape[-1]`
+    #  - all gradients except the probe are normalized by probe intensity
+    #  - all gradients are normalized by the pixel count per diffraction pattern
+    #    (relative to `_NPIX_REFERENCE`), for invariance to detector
+    #    padding/resampling (`sim_shape` changes)
+    #  - the object gradient is additionally normalized by `scan_density`, for
+    #    invariance to scan step size (see compute_scan_density's docstring)
+    npix = pattern_mask.shape[-2] * pattern_mask.shape[-1]
     for k in grad.keys():
-        # scale gradients appropriately
-        # per-pattern variables are normalized by the grouping `group.shape[-1]`
-        # Additionally, all gradients except the probe should be normalized by probe intensity
         grad[k] /= xp.array(
-            (1.0 if k in _PER_ITER_VARS else group.shape[-1]) * (1.0 if k == 'probe' else probe_int),
+            (1.0 if k in _PER_ITER_VARS else group.shape[-1])
+            * (1.0 if k == 'probe' else probe_int)
+            * (npix / _NPIX_REFERENCE)
+            * (scan_density if k == 'object' else 1.0),
             dtype=dtype
         )
 
