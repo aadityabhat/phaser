@@ -63,6 +63,7 @@ class EnginePlan(Dataclass, kw_only=True):
     update_object: FlagLike = True
     update_positions: FlagLike = False
     update_tilt: FlagLike = False
+    update_distortion: FlagLike = False
 
     calc_error: FlagLike = Flag(every=1)
     calc_error_fraction: float = 0.1
@@ -168,6 +169,9 @@ class PolyakSGDSolverPlan(Dataclass, kw_only=True):
 GradientSolverHook.known['sgd'] = ('phaser.engines.gradient.solvers:SGDSolver', SGDSolverPlan)
 GradientSolverHook.known['adam'] = ('phaser.engines.gradient.solvers:AdamSolver', AdamSolverPlan)
 GradientSolverHook.known['polyak_sgd'] = ('phaser.engines.gradient.solvers:PolyakSGDSolver', PolyakSGDSolverPlan)
+
+from .engines.common.strain import StrainDistortionSolverProps  # noqa: E402
+GradientSolverHook.known['strain_distortion'] = ('phaser.engines.common.strain:StrainDistortionSolver', StrainDistortionSolverProps)
 
 EngineHook.known['conventional'] = ('phaser.engines.conventional.run:run_engine', ConventionalEnginePlan)
 EngineHook.known['gradient'] = ('phaser.engines.gradient.run:run_engine', GradientEnginePlan)

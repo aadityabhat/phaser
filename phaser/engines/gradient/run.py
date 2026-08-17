@@ -21,10 +21,11 @@ from phaser.hooks.regularization import CostRegularizer, GroupConstraint
 from phaser.plan import GradientEnginePlan
 from phaser.types import process_flag, ReconsVar
 from ..common.simulation import GroupManager, make_propagators, tilt_propagators, slice_forwards, stream_patterns
+from ..common.strain import strain_perturbation
 
 
 logger = logging.getLogger(__name__)
-_PER_ITER_VARS: t.FrozenSet[ReconsVar] = frozenset({'positions', 'tilt'})
+_PER_ITER_VARS: t.FrozenSet[ReconsVar] = frozenset({'positions', 'tilt', 'distortion'})
 
 
 def process_solvers(
@@ -86,6 +87,16 @@ def extract_vars(state: ReconsState, vars: t.AbstractSet[ReconsVar], group: t.Op
                 d[var] = val
             return None
         return val
+
+    if 'distortion' in vars:
+        # 'distortion' has no backing field in ReconsState: it's an ephemeral,
+        # always-zero per-position local strain (npos, 4) whose *gradient* (via
+        # autodiff, see run_model's strain perturbation) is what's actually used.
+        # Captured before the tree_map below, since that call may null out
+        # state.scan (if 'positions' is also being extracted this iteration).
+        n = int(group.shape[-1]) if group is not None else int(state.scan.shape[0])
+        xp = get_array_module(state.scan)
+        d['distortion'] = xp.zeros((n, 4), dtype=to_real_dtype(state.scan.dtype))
 
     state = jax.tree_util.tree_map_with_path(f, state, is_leaf=lambda x: x is None)
     return (d, state)
@@ -180,6 +191,7 @@ def run_engine(args: EngineArgs, props: GradientEnginePlan) -> ReconsState:
         'object': process_flag(props.update_object),
         'positions': process_flag(props.update_positions),
         'tilt': process_flag(props.update_tilt),
+        'distortion': process_flag(props.update_distortion),
     }
     # shuffle_groups defaults to True for sparse groups, False for compact groups
     shuffle_groups = process_flag(props.shuffle_groups or not props.compact)
@@ -381,6 +393,9 @@ def run_model(
     group_obj = sim.object.sampling.get_view_at_pos(sim.object.data, group_scan, probes.shape[-2:])
     group_subpx_filters = fourier_shift_filter(ky, kx, sim.object.sampling.get_subpx_shifts(group_scan, probes.shape[-2:]))[:, None, ...]
     probes = ifft2(fft2(probes) * group_subpx_filters)
+
+    if 'distortion' in vars:
+        group_obj = group_obj + strain_perturbation(sim.object, group_scan, vars['distortion'], probes.shape[-2:])
 
     def sim_slice(slice_i: int, prop: t.Optional[NDArray[numpy.complexfloating]], psi):
         # psi: (batch, n_probe, Ny, Nx)
