@@ -24,7 +24,8 @@ from phaser.state import ObjectState, ProbeState, ReconsState, IterState
 from phaser.plan import AmplitudeNoisePlan
 from phaser.engines.common.noise_models import AmplitudeNoiseModel
 from phaser.engines.gradient.run import run_model, SolverStates
-from phaser.engines.common.strain import StrainDistortionSolver, StrainDistortionSolverProps
+from phaser.engines.common.strain import StrainDistortionSolver, StrainDistortionSolverProps, strain_perturbation
+from phaser.engines.common.simulation import make_propagators
 import phaser.utils.tree as tree
 
 
@@ -151,3 +152,56 @@ def test_strain_solver_decreases_loss_end_to_end():
 
     loss_after = float(_loss(new_state, patterns, mask, noise_model, solver_states, group, {}))
     assert loss_after < loss0
+
+
+def test_strain_perturbation_preserves_object_dtype():
+    """Regression test: ObjectSampling's host-side sampling/subpx-shift math runs at
+    float64 regardless of the reconstruction's working dtype, which previously let a
+    float32 (complex64) object's perturbation delta silently promote to complex128.
+    Adding that into group_obj inside a multislice reconstruction crashes
+    jax.lax.scan (fixed carry dtype required across the slice loop) -- caught live on
+    a real dataset. Exercise the actual multislice/jax.lax.scan path (n_slices > 1),
+    not just the single-slice shortcut the other tests use."""
+    rng = numpy.random.default_rng(1)
+
+    (ny, nx) = (24, 24)
+    (by, bx) = (10, 10)
+    npos = 5
+    n_slices = 3
+
+    obj_sampling = ObjectSampling((ny, nx), sampling=(1.0, 1.0))
+    obj_phase = rng.normal(0, 0.3, (n_slices, ny, nx)).astype(numpy.float32)
+    obj_amp = (1.0 - 0.1 * rng.random((n_slices, ny, nx))).astype(numpy.float32)
+    obj_data = jnp.array(obj_amp * numpy.exp(1j * obj_phase), dtype=jnp.complex64)
+    obj_state = ObjectState(obj_sampling, obj_data, jnp.array([50.0, 50.0, 50.0], dtype=jnp.float32))
+
+    probe_sampling = Sampling((by, bx), sampling=(1.0, 1.0))
+    probe_data = jnp.array(
+        (rng.normal(0, 1, (1, by, bx)) + 1j * rng.normal(0, 1, (1, by, bx))).astype(numpy.complex64)
+    )
+    probe_state = ProbeState(probe_sampling, probe_data)
+    scan = jnp.array(rng.uniform(-4, 4, (npos, 2)), dtype=jnp.float32)
+
+    state = ReconsState(
+        iter=IterState.empty(), wavelength=0.025, probe=probe_state, object=obj_state,
+        scan=scan, tilt=None, progress={},
+    )
+
+    eps = jnp.zeros((npos, 4), dtype=jnp.float32)
+    delta = strain_perturbation(obj_state, scan, eps, (by, bx))
+    assert delta.dtype == obj_data.dtype, f"expected {obj_data.dtype}, got {delta.dtype}"
+
+    patterns = jnp.array(rng.uniform(0.1, 1.0, (npos, by, bx)), dtype=jnp.float32)
+    mask = jnp.ones((by, bx), dtype=jnp.float32)
+    noise_model = AmplitudeNoiseModel(None, AmplitudeNoisePlan())
+    solver_states = SolverStates(noise_model_state=None, group_solver_states=[], regularizer_states=[], group_constraint_states=[])
+    group = jnp.arange(npos)[None, :]
+    props = make_propagators(state, bwlim_frac=None)
+
+    (loss, _aux) = run_model(
+        {'distortion': eps}, state, group=group, props=props,
+        group_patterns=patterns, pattern_mask=mask,
+        noise_model=noise_model, regularizers=(), solver_states=solver_states,
+        xp=jnp, dtype=numpy.float32, jit_unroll_slices=False,
+    )
+    assert numpy.isfinite(float(loss))

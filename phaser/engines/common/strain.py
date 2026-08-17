@@ -87,10 +87,19 @@ def strain_perturbation(
     eps_yx = eps[:, 2][:, None, None, None]
     eps_yy = eps[:, 3][:, None, None, None]
 
-    return (
+    delta = (
         -(eps_xx * off_x + eps_xy * off_y) * group_dx
         - (eps_yx * off_x + eps_yy * off_y) * group_dy
     )
+    # ObjectSampling's host-side sampling/subpx-shift arithmetic runs at float64
+    # regardless of the reconstruction's working dtype, so `delta` may have been
+    # promoted above group_obj's precision (e.g. complex64 -> complex128 under a
+    # float32 plan). Cast back to match group_obj exactly: at eps=0 the value is
+    # exactly zero regardless of dtype, so this doesn't affect the "forward model
+    # unchanged at eps=0" guarantee, and letting a higher-precision delta leak into
+    # group_obj breaks jax.lax.scan's multislice loop, which requires a fixed carry
+    # dtype throughout (observed as a scan carry dtype-mismatch crash on real data).
+    return delta.astype(obj.data.dtype)
 
 
 def _scattered_linear_zero_fill(points: NDArray, values: NDArray, query: NDArray) -> NDArray:
