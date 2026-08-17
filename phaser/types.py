@@ -76,7 +76,7 @@ class _ReconsVarsAnnotation(ConvertAnnotation):
 
 
 BackendName: t.TypeAlias = t.Literal['cupy', 'jax', 'torch', 'numpy']
-ReconsVar: t.TypeAlias = t.Literal['object', 'probe', 'positions', 'tilt']
+ReconsVar: t.TypeAlias = t.Literal['object', 'probe', 'positions', 'tilt', 'distortion']
 
 ReconsVars: t.TypeAlias = t.Annotated[t.FrozenSet[ReconsVar], _ReconsVarsAnnotation()]
 EmptyDict: t.TypeAlias = t.Annotated[t.Dict[t.NoReturn, t.NoReturn], _EmptyDictAnnotation()]

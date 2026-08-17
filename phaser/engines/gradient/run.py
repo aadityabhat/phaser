@@ -22,10 +22,11 @@ from phaser.hooks.regularization import CostRegularizer, GroupConstraint
 from phaser.plan import GradientEnginePlan
 from phaser.types import process_flag, ReconsVar
 from ..common.simulation import GroupManager, make_propagators, tilt_propagators, slice_forwards, stream_patterns
+from ..common.strain import strain_perturbation
 
 
 logger = logging.getLogger(__name__)
-_PER_ITER_VARS: t.FrozenSet[ReconsVar] = frozenset({'positions', 'tilt'})
+_PER_ITER_VARS: t.FrozenSet[ReconsVar] = frozenset({'positions', 'tilt', 'distortion'})
 
 
 def process_solvers(
@@ -88,6 +89,17 @@ def extract_vars(state: ReconsState, vars: t.AbstractSet[ReconsVar], group: t.Op
                 d[var] = val
             return None
         return val
+
+    if 'distortion' in vars:
+        # 'distortion' has no backing field in ReconsState: it's an ephemeral,
+        # always-zero per-position local strain (npos, 4) whose *gradient* (via
+        # autodiff, see strain_perturbation in run_model) is what's actually used.
+        # `group`'s last axis is the batch size (see run_group's `group.shape[-1]`
+        # usage); captured before the tree.map_with_path below, since that call
+        # may null out state.scan (if 'positions' is also being extracted).
+        n = int(group.shape[-1]) if group is not None else int(state.scan.shape[0])
+        xp = get_array_module(state.scan)
+        d['distortion'] = xp.zeros((n, 4), dtype=to_real_dtype(state.scan.dtype))
 
     state = tree.map_with_path(f, state, is_leaf=lambda x: x is None)
     return (d, state)
@@ -174,6 +186,7 @@ def run_engine(args: EngineArgs, props: GradientEnginePlan) -> ReconsState:
         'object': process_flag(props.update_object),
         'positions': process_flag(props.update_positions),
         'tilt': process_flag(props.update_tilt),
+        'distortion': process_flag(props.update_distortion),
     }
     # shuffle_groups defaults to True for sparse groups, False for compact groups
     shuffle_groups = process_flag(props.shuffle_groups or not props.compact)
@@ -447,6 +460,11 @@ def run_model(
     group_subpx_filters = fourier_shift_filter(ky, kx, sim.object.sampling.get_subpx_shifts(group_scan, probes.shape[-2:]))
     # (group, mode, y, x)
     probes = ifft2(fft2(probes, shift=False) * group_subpx_filters[:, None], shift=False)
+
+    if 'distortion' in vars:
+        # applied post-ifft2shift, in the same corner-shifted pixel layout group_obj
+        # is already in, so the perturbation lines up pixel-for-pixel with group_obj
+        group_obj = group_obj + ifft2shift(strain_perturbation(sim.object, group_scan, vars['distortion'], probes.shape[-2:]))
 
     def sim_slice(slice_i: int, prop: t.Optional[NDArray[numpy.complexfloating]], psi):
         if prop is not None:

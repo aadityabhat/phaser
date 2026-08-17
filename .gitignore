@@ -7,6 +7,8 @@ __pycache__/
 /dist/
 /venv/
 /.venv/
+/.venv_test/
+/.venv_test_develop/
 /docs/_build/
 /docs/build/
 /site/
