@@ -818,6 +818,22 @@ def check_finite(*arrs: NDArray[numpy.inexact], context: t.Optional[str] = None)
         raise ValueError("NaN or inf encountered")
 
 
+def brake(update: NDArray[numpy.floating], max_magnitude: float, *, axis: int = -1) -> NDArray[numpy.floating]:
+    """Soft-clip `update`'s per-row magnitude (norm along `axis`) to `max_magnitude`,
+    preserving direction -- a smooth arctan rolloff that asymptotically approaches
+    but never exceeds the cap, rather than a hard elbow.
+
+    Ported from the CuPy reference implementation's `brake()` (`python/ptycho/common.py`),
+    generalized from a scalar/complex modulus to a magnitude taken along `axis` (e.g. the
+    (dy, dx) vector per scan position, or the 4-component strain vector per position).
+    """
+    xp = get_array_module(update)
+    mag = xp.linalg.norm(update, axis=axis, keepdims=True)
+    scale = xp.arctan(mag * (xp.pi / (2 * max_magnitude))) * (2 * max_magnitude / xp.pi) / mag
+    result = update * scale
+    return xp.where(xp.isfinite(result), result, xp.zeros_like(update))
+
+
 @tree_dataclass(frozen=True, init=False, drop_fields=('extent',))
 class Sampling:
     shape: NDArray[numpy.int_]
@@ -1097,6 +1113,6 @@ __all__ = [
     'to_complex_dtype', 'to_real_dtype',
     'fft2', 'ifft2', 'fft2shift', 'ifft2shift',
     'abs2', 'split_array', 'unstack',
-    'at', 'ufunc_outer', 'check_finite',
+    'at', 'ufunc_outer', 'check_finite', 'brake',
     'Sampling', 'IndexLike',
 ]

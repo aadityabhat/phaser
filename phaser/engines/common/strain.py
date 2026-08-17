@@ -28,7 +28,7 @@ import numpy
 from numpy.typing import NDArray
 
 from phaser.types import Dataclass
-from phaser.utils.num import get_array_module, to_real_dtype, to_numpy
+from phaser.utils.num import brake, get_array_module, to_real_dtype, to_numpy
 from phaser.hooks.solver import GradientSolver, GradientSolverArgs
 
 if t.TYPE_CHECKING:
@@ -205,7 +205,8 @@ class StrainDistortionSolverProps(Dataclass):
     step_size: float = 1e-2
     """Fraction of the strain gradient to convert into a displacement-producing update."""
     max_step_size: t.Optional[float] = None
-    """Maximum per-position strain-update magnitude (clips before the Poisson solve)."""
+    """Maximum per-position strain-update magnitude, soft-clipped (see `phaser.utils.num.brake`)
+    before the Poisson solve."""
 
 
 class StrainDistortionSolver(GradientSolver[None]):
@@ -242,8 +243,7 @@ class StrainDistortionSolver(GradientSolver[None]):
         # not the raw dLoss/deps -- scale directly, don't negate again.
         delta_eps = self.step_size * grad['distortion']
         if self.max_step_size is not None:
-            mag = xp.linalg.norm(delta_eps, axis=-1, keepdims=True)
-            delta_eps = delta_eps * xp.minimum(mag, self.max_step_size) / xp.maximum(mag, 1e-30)
+            delta_eps = brake(delta_eps, self.max_step_size)
 
         corner = sim.object.sampling.corner
         sampling = sim.object.sampling.sampling

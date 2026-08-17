@@ -26,7 +26,7 @@ import typing as t
 import numpy
 from numpy.typing import NDArray
 
-from phaser.utils.num import get_array_module, to_real_dtype, xp_is_torch
+from phaser.utils.num import brake, get_array_module, to_real_dtype, xp_is_torch
 import phaser.utils.tree as tree
 from phaser.hooks.solver import GradientSolver, GradientSolverArgs
 from phaser.hooks.schedule import ScheduleLike, Schedule
@@ -110,10 +110,14 @@ class SGDSolver(ScheduledSolver):
                 return chain(
                     trace(kwargs['momentum'], props.nesterov),
                     scale_by_learning_rate(kwargs['learning_rate']),
+                    scale_by_brake(props.max_step_size),
                 )
         else:
             def factory(**kwargs: t.Any) -> GradientTransformation:
-                return scale_by_learning_rate(kwargs['learning_rate'])
+                return chain(
+                    scale_by_learning_rate(kwargs['learning_rate']),
+                    scale_by_brake(props.max_step_size),
+                )
 
         super().__init__('sgd', factory, hparams, args['params'])
 
@@ -206,6 +210,32 @@ def scale_by_learning_rate(
     def update_fn(updates: Updates, state: None, params=None, **extra_args: t.Any):
         del params
         updates = tree.map(lambda g: learning_rate * g, updates)
+        return updates, state
+
+    return GradientTransformation(lambda params: None, update_fn)
+
+
+# variables `scale_by_brake` will soft-clip: per-position vectors, where a
+# magnitude cap along the last axis is physically meaningful. Object/probe
+# updates aren't vectors-per-something, so a norm along their last (pixel)
+# axis wouldn't mean anything -- left untouched even if a solver handling them
+# sets `max_step_size` (e.g. an SGDSolver shared across multiple variables).
+_BRAKE_VARS: t.FrozenSet[ReconsVar] = frozenset({'positions', 'tilt'})
+
+
+def scale_by_brake(max_magnitude: t.Optional[float]) -> GradientTransformation:
+    """Soft-clip position/tilt updates' per-step magnitude to `max_magnitude` via
+    `phaser.utils.num.brake` (ported from CuPy's `brake()`), preserving direction.
+    A no-op if `max_magnitude` is None.
+    """
+    def update_fn(updates: Updates, state: None, params=None, **extra_args: t.Any):
+        del params
+        if max_magnitude is None:
+            return updates, state
+        updates = {
+            k: (brake(v, max_magnitude) if k in _BRAKE_VARS else v)
+            for (k, v) in updates.items()
+        }
         return updates, state
 
     return GradientTransformation(lambda params: None, update_fn)

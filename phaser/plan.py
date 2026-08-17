@@ -161,6 +161,10 @@ class SGDSolverPlan(Dataclass, kw_only=True):
     learning_rate: ScheduleLike
     momentum: t.Optional[ScheduleLike] = None
     nesterov: bool = True
+    max_step_size: t.Optional[float] = None
+    """Maximum per-position update magnitude (only meaningful for vector per-position
+    variables, e.g. positions/tilt -- see `phaser.engines.gradient.solvers.scale_by_brake`),
+    soft-clipped via `phaser.utils.num.brake`. Ignored for object/probe."""
 
 
 class AdamSolverPlan(Dataclass, kw_only=True):
