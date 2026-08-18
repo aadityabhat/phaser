@@ -306,7 +306,7 @@ def initialize_reconstruction(
 
     if init_state.scan is not None and plan.init.scan is None:
         logging.info("Re-using scan from initial state...")
-        scan = init_state.scan
+        scan = init_state.scan.astype(dtype)
     else:
         logging.info("Initializing scan...")
         scan = pane.from_data(scan_hook, ScanHook)(  # type: ignore
@@ -315,7 +315,7 @@ def initialize_reconstruction(
 
     if init_state.tilt is not None and plan.init.tilt is None:
         logging.info("Re-using tilt from initial state...")
-        tilt = init_state.tilt
+        tilt = init_state.tilt.astype(dtype)
     elif tilt_hook is not None:
         logging.info("Initializing tilt...")
         tilt = pane.from_data(tilt_hook, TiltHook)(  # type: ignore
