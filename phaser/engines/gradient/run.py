@@ -35,6 +35,18 @@ _PER_ITER_VARS: t.FrozenSet[ReconsVar] = frozenset({'positions', 'tilt', 'distor
 # no-op (factor of 1) at that baseline and only rescales gradients when `sim_shape`
 # actually changes -- existing learning rates don't need to be re-derived from scratch.
 _NPIX_REFERENCE: int = 192 * 192
+# Reference probe-intensity/scan-density values, same role as _NPIX_REFERENCE but for
+# the two other data-dependent gradient-scaling factors: `probe_int` (used only in
+# _regularizer_compensation -- the main per-group grad-scaling loop below has always
+# divided by raw probe_int, since before, and existing learning rates are tuned
+# against that, so it's deliberately left alone there) and `scan_density` (used both
+# in the main grad-scaling loop for 'object' and in _regularizer_compensation).
+# Calibrated from an actual reconstruction run on recon2/r2a.yaml's cropped SiC data
+# (job 5449101, logged "probe_int: 1.6685e+05, scan_density: 5.5435e+03") so both are
+# a no-op (factor of 1) at that baseline -- existing learning_rate/cost values don't
+# need to be re-derived from scratch for that config, only when it changes.
+_PROBE_INT_REFERENCE: float = 1.6685e5
+_SCAN_DENSITY_REFERENCE: float = 5.5435e3
 
 
 def process_solvers(
@@ -271,6 +283,10 @@ def run_engine(args: EngineArgs, props: GradientEnginePlan) -> ReconsState:
     state.probe.data *= xp.sqrt(rescale_factor)
     probe_int = xp.sum(abs2(state.probe.data))
     scan_density = compute_scan_density(state, xp, dtype)
+    logger.info(
+        f"probe_int: {float(probe_int):.4e}, scan_density: {float(scan_density):.4e} "
+        f"(gradient-scaling reference values -- see _PROBE_INT_REFERENCE/_SCAN_DENSITY_REFERENCE)"
+    )
 
     observer.start_engine(state)
 
@@ -446,15 +462,16 @@ def run_group(
     #  - all gradients are normalized by the pixel count per diffraction pattern
     #    (relative to `_NPIX_REFERENCE`), for invariance to detector
     #    padding/resampling (`sim_shape` changes)
-    #  - the object gradient is additionally normalized by `scan_density`, for
-    #    invariance to scan step size (see compute_scan_density's docstring)
+    #  - the object gradient is additionally normalized by `scan_density`
+    #    (relative to `_SCAN_DENSITY_REFERENCE`), for invariance to scan step
+    #    size (see compute_scan_density's docstring)
     npix = pattern_mask.shape[-2] * pattern_mask.shape[-1]
     for k in grad.keys():
         grad[k] /= xp.array(
             (1.0 if k in _PER_ITER_VARS else group.shape[-1])
             * (1.0 if k == 'probe' else probe_int)
             * (npix / _NPIX_REFERENCE)
-            * (scan_density if k == 'object' else 1.0),
+            * (scan_density / _SCAN_DENSITY_REFERENCE if k == 'object' else 1.0),
             dtype=dtype
         )
 
@@ -492,12 +509,23 @@ def _regularizer_compensation(
     probe/data intensity, `sim_shape`, or scan step size change. Mirrors exactly what
     that division applies to whichever variable(s) `params` says the regularizer
     perturbs (only 'object' and 'probe' are meaningful here today).
+
+    Uses `probe_int`/`scan_density` *relative to their references* here (unlike
+    run_group's own division, which uses raw `probe_int` for the main gradient --
+    that's pre-existing and already what current learning rates are tuned against).
+    Since run_group's divisor for 'object' also carries `scan_density` (relative to
+    the same reference), that factor cancels top and bottom regardless of the
+    reference's value -- only `probe_int`'s cancellation is asymmetric (raw on the
+    bottom, reference-relative on top), which is what makes a regularizer's final
+    contribution end up genuinely independent of runtime probe_int and scan_density
+    (a prior on the object/probe has nothing to do with either), with the reference
+    constants purely calibrating its absolute magnitude.
     """
     compensation = npix / _NPIX_REFERENCE
     if 'probe' not in params:
-        compensation = compensation * probe_int
+        compensation = compensation * (probe_int / _PROBE_INT_REFERENCE)
     if 'object' in params:
-        compensation = compensation * scan_density
+        compensation = compensation * (scan_density / _SCAN_DENSITY_REFERENCE)
     return compensation
 
 

@@ -2,15 +2,19 @@
 (`phaser.engines.gradient.run._regularizer_compensation`).
 
 `run_group` normalizes the combined (detector + regularizer) gradient by probe
-intensity, npix (relative to `_NPIX_REFERENCE`), and (for 'object') scan_density --
-see run.py's grad-scaling comment. Since a `CostRegularizer`'s loss is summed into
-the *same* combined loss before that division happens, its own contribution gets
-divided by those same factors too, unless pre-compensated -- which would make a
-regularizer's effective strength (relative to the detector fit) drift whenever
-probe intensity, sim_shape, or scan density change, defeating the whole point of
-normalizing the detector loss in the first place. `_regularizer_compensation`
-pre-multiplies each regularizer's loss by exactly the factors `run_group` will
-later divide out for the variable(s) it touches, canceling to a no-op.
+intensity, npix (relative to `_NPIX_REFERENCE`), and (for 'object') scan_density
+(relative to `_SCAN_DENSITY_REFERENCE`) -- see run.py's grad-scaling comment. Since
+a `CostRegularizer`'s loss is summed into the *same* combined loss before that
+division happens, its own contribution gets divided by those same factors too,
+unless pre-compensated -- which would make a regularizer's effective strength
+(relative to the detector fit) drift whenever probe intensity, sim_shape, or scan
+density change, defeating the whole point of normalizing the detector loss in the
+first place. `_regularizer_compensation` pre-multiplies each regularizer's loss by
+`probe_int`/`scan_density` *relative to their references* (unlike run_group's own
+division, which uses raw `probe_int` for the main gradient -- see
+`_regularizer_compensation`'s docstring for why that asymmetry is what makes a
+regularizer's contribution end up genuinely independent of runtime probe_int and
+scan_density, with the references purely calibrating its absolute magnitude).
 """
 import numpy
 import pytest
@@ -30,7 +34,7 @@ from phaser.engines.common.noise_models import AmplitudeNoiseModel
 from phaser.engines.common.regularizers import ObjL2, ProbeRecipTikhonov
 from phaser.engines.gradient.run import (
     run_group, extract_vars, SolverStates, compute_scan_density, _NPIX_REFERENCE,
-    _regularizer_compensation,
+    _PROBE_INT_REFERENCE, _SCAN_DENSITY_REFERENCE, _regularizer_compensation,
 )
 import phaser.utils.tree as tree
 
@@ -38,19 +42,28 @@ import phaser.utils.tree as tree
 # ---- _regularizer_compensation (unit-level) ---------------------------------
 
 def test_compensation_for_object_regularizer_includes_probe_int_and_density():
-    c = _regularizer_compensation(frozenset({'object'}), probe_int=7.0, npix=2 * _NPIX_REFERENCE, scan_density=3.0)
+    c = _regularizer_compensation(
+        frozenset({'object'}), probe_int=7.0 * _PROBE_INT_REFERENCE,
+        npix=2 * _NPIX_REFERENCE, scan_density=3.0 * _SCAN_DENSITY_REFERENCE,
+    )
     assert c == pytest.approx(7.0 * 2.0 * 3.0)
 
 
 def test_compensation_for_probe_regularizer_excludes_probe_int_and_density():
     """Mirrors run_group's exemption of 'probe' from the probe_int divisor, and
     scan_density only ever applying to 'object' (matching CuPy's ow_scalar)."""
-    c = _regularizer_compensation(frozenset({'probe'}), probe_int=7.0, npix=2 * _NPIX_REFERENCE, scan_density=3.0)
+    c = _regularizer_compensation(
+        frozenset({'probe'}), probe_int=7.0 * _PROBE_INT_REFERENCE,
+        npix=2 * _NPIX_REFERENCE, scan_density=3.0 * _SCAN_DENSITY_REFERENCE,
+    )
     assert c == pytest.approx(2.0)
 
 
-def test_compensation_is_noop_at_reference_pixel_count_with_unit_density():
-    c = _regularizer_compensation(frozenset({'object'}), probe_int=1.0, npix=_NPIX_REFERENCE, scan_density=1.0)
+def test_compensation_is_noop_at_reference_values():
+    c = _regularizer_compensation(
+        frozenset({'object'}), probe_int=_PROBE_INT_REFERENCE,
+        npix=_NPIX_REFERENCE, scan_density=_SCAN_DENSITY_REFERENCE,
+    )
     assert c == pytest.approx(1.0)
 
 

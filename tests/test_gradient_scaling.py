@@ -22,6 +22,7 @@ from phaser.plan import AmplitudeNoisePlan, AdamSolverPlan
 from phaser.engines.common.noise_models import AmplitudeNoiseModel
 from phaser.engines.gradient.run import (
     run_group, extract_vars, SolverStates, compute_scan_density, _NPIX_REFERENCE,
+    _SCAN_DENSITY_REFERENCE,
 )
 from phaser.engines.gradient.solvers import AdamSolver
 import phaser.utils.tree as tree
@@ -179,7 +180,7 @@ def test_run_group_position_grad_matches_manual_normalization():
 
 def test_run_group_object_grad_matches_manual_normalization():
     """Same check for 'object': normalized grad must equal raw grad divided by
-    group_size * probe_int * (npix / _NPIX_REFERENCE) * scan_density."""
+    group_size * probe_int * (npix / _NPIX_REFERENCE) * (scan_density / _SCAN_DENSITY_REFERENCE)."""
     (state, patterns, mask, noise_model, group, npos) = _make_toy_problem(npos=5, by=8, bx=8)
 
     from phaser.engines.gradient.run import run_model
@@ -195,7 +196,9 @@ def test_run_group_object_grad_matches_manual_normalization():
     probe_int = jnp.sum(abs2(state.probe.data))
     npix = mask.shape[-2] * mask.shape[-1]
     scan_density = compute_scan_density(state, jnp, numpy.float64)
-    expected = raw_grad['object'] / (group.shape[-1] * probe_int * (npix / _NPIX_REFERENCE) * scan_density)
+    expected = raw_grad['object'] / (
+        group.shape[-1] * probe_int * (npix / _NPIX_REFERENCE) * (scan_density / _SCAN_DENSITY_REFERENCE)
+    )
 
     # run_group is jit-compiled, so a Python-side-effect capture (e.g. writing into a
     # closed-over dict from inside .update()) would only ever record a trace-time
