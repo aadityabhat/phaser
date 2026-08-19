@@ -155,7 +155,7 @@ def test_object_regularizer_contribution_without_compensation_would_have_scaled(
     something (not trivially true regardless of compensation)."""
     def raw_reg_grad(probe_scale, seed=0):
         (state, patterns, mask, noise_model, group) = _make_toy_problem(seed=seed, probe_scale=probe_scale)
-        (loss, _) = ObjL2(None, CostRegularizerProps(cost=1.0)).calc_loss_group(group, state, None)
+        (loss, _) = ObjL2(None, CostRegularizerProps(cost=1.0)).calc_loss_group(group, state, None, group.shape[-1])
         return loss
 
     # the raw (uncompensated) loss value itself doesn't depend on probe at all --
@@ -188,7 +188,7 @@ def test_probe_regularizer_contribution_matches_manual_normalization():
             probe=ProbeState(state_a.probe.sampling, probe_data), object=state_a.object,
             scan=state_a.scan, tilt=state_a.tilt, progress=state_a.progress,
         )
-        return reg.calc_loss_group(group, s, None)[0]
+        return reg.calc_loss_group(group, s, None, group.shape[-1])[0]
 
     raw_grad = numpy.asarray(jax.grad(loss_fn)(state_a.probe.data))
 
@@ -243,3 +243,58 @@ def _probe_grad_via_recording_solver(state, patterns, mask, noise_model, group, 
         xp=xp, dtype=numpy.float64, jit_unroll_slices=False,
     )
     return solver_states.group_solver_states[0]
+
+
+# ---- cost_scale scan-size (grouping-count) fix ------------------------------
+
+def test_cost_scale_uses_full_scan_size_not_group_size():
+    """Regression test for the cost_scale bug: `calc_loss_group` used to compute
+    `group.shape[-1] / prod(sim.scan.shape[:-1])`, intended as a group_size/npos
+    fraction -- but by the time it's called inside run_model, sim.scan has
+    already been restricted to the current group (see insert_vars), so both
+    sides were always equal and it was a permanent no-op (always 1.0). Now
+    total_npos is threaded in explicitly from outside (captured before that
+    restriction happens), so a group that's a proper subset of the full scan
+    must produce a loss scaled by group_size/total_npos, not 1.0.
+
+    Reproduces the group-already-restricted scenario directly (calc_loss_group
+    is called here exactly as run_model calls it, not via the full pipeline)."""
+    (state, patterns, mask, noise_model, group) = _make_toy_problem(npos=8)
+    reg = ObjL2(None, CostRegularizerProps(cost=1.0))
+
+    full_group = jnp.arange(8)[None, :]
+    half_group = jnp.arange(4)[None, :]
+
+    # mimics insert_vars restricting sim.scan to the current group, exactly as
+    # happens inside run_model before calc_loss_group is ever called
+    half_restricted_sim = ReconsState(
+        iter=state.iter, wavelength=state.wavelength, probe=state.probe, object=state.object,
+        scan=state.scan[tuple(half_group)], tilt=state.tilt, progress=state.progress,
+    )
+
+    (loss_full, _) = reg.calc_loss_group(full_group, state, None, total_npos=8)
+    (loss_half, _) = reg.calc_loss_group(half_group, half_restricted_sim, None, total_npos=8)
+
+    # obj_l2's raw cost is a whole-object quantity independent of which group is
+    # active, so the two losses should differ by exactly the group-size ratio
+    # (4/8 = 0.5) -- under the old bug, loss_half/loss_full would have been 1.0
+    # instead (cost_scale silently canceling to a no-op both times).
+    numpy.testing.assert_allclose(float(loss_half), float(loss_full) * 0.5, rtol=1e-6)
+
+
+def test_probe_cost_scale_now_applies_scan_size_normalization():
+    """Probe regularizers previously had cost_scale = 1.0 (no scan-size
+    normalization attempted at all). Confirm they now get the same
+    group_size/total_npos treatment as object regularizers."""
+    (state, patterns, mask, noise_model, group) = _make_toy_problem(npos=8)
+    reg = ProbeRecipTikhonov(None, CostRegularizerProps(cost=1.0))
+
+    full_group = jnp.arange(8)[None, :]
+    half_group = jnp.arange(4)[None, :]
+
+    (loss_full, _) = reg.calc_loss_group(full_group, state, None, total_npos=8)
+    (loss_half, _) = reg.calc_loss_group(half_group, state, None, total_npos=8)
+
+    # probe_recip_tikh's raw cost depends only on probe.data (untouched by which
+    # group is active), so again the losses should differ by exactly 4/8 = 0.5
+    numpy.testing.assert_allclose(float(loss_half), float(loss_full) * 0.5, rtol=1e-6)

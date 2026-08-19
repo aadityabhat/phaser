@@ -425,12 +425,17 @@ def run_group(
     jit_unroll_slices: t.Union[int, bool],
 ) -> t.Tuple[ReconsState, t.Dict[str, numpy.floating], t.Dict[ReconsVar, t.Any], SolverStates]:
     xp = cast_array_module(xp)
+    # captured before extract_vars/insert_vars restrict scan to the current group --
+    # regularizers need the *full* scan size for scan-size (grouping-count)
+    # invariance, since their loss isn't naturally proportional to group size the
+    # way the detector loss is (see CostRegularizer.calc_loss_group's docstring).
+    total_npos = int(numpy.prod(state.scan.shape[:-1]))
 
     (grad, (solver_states, group_losses)) = tree.grad(run_model, has_aux=True, xp=xp, sign=-1)(
         *extract_vars(state, vars, group),
         group=group, props=props, group_patterns=group_patterns, pattern_mask=pattern_mask,
         noise_model=noise_model, regularizers=regularizers, solver_states=solver_states,
-        probe_int=probe_int, scan_density=scan_density,
+        probe_int=probe_int, scan_density=scan_density, total_npos=total_npos,
         xp=xp, dtype=dtype, jit_unroll_slices=jit_unroll_slices
     )
     # scale gradients appropriately (mirrors CuPy reference's gradcalc.py normalization,
@@ -513,6 +518,7 @@ def run_model(
     solver_states: SolverStates,
     probe_int: t.Union[float, numpy.floating],
     scan_density: t.Union[float, numpy.floating],
+    total_npos: int,
     xp: t.Any,
     dtype: t.Type[numpy.floating],
     jit_unroll_slices: t.Union[int, bool],
@@ -556,7 +562,7 @@ def run_model(
     npix = pattern_mask.shape[-2] * pattern_mask.shape[-1]
     for (reg_i, reg) in enumerate(regularizers):
         (reg_loss, solver_states.regularizer_states[reg_i]) = reg.calc_loss_group(
-            group, sim, solver_states.regularizer_states[reg_i]
+            group, sim, solver_states.regularizer_states[reg_i], total_npos
         )
         reg_loss = reg_loss * _regularizer_compensation(reg.params, probe_int, npix, scan_density)
         losses[reg.name()] = reg_loss

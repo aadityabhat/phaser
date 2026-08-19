@@ -36,7 +36,14 @@ class CostRegularizer(HasState[StateT], t.Protocol[StateT]):
     def name(self) -> str:
         ...
 
-    def calc_loss_group(self, group: NDArray[numpy.integer], sim: 'ReconsState', state: StateT) -> t.Tuple['Float', StateT]:
+    def calc_loss_group(
+        self, group: NDArray[numpy.integer], sim: 'ReconsState', state: StateT, total_npos: int,
+    ) -> t.Tuple['Float', StateT]:
+        """`total_npos` is the *full* scan's position count -- `sim.scan` itself is
+        already restricted to the current group by this point, so it can't be
+        recovered from `sim` alone. Used for scan-size (grouping-count) invariance,
+        e.g. `group.shape[-1] / total_npos` to normalize a regularizer's loss, which
+        (unlike the detector loss) isn't naturally proportional to group size."""
         ...
 
 

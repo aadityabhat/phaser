@@ -1,6 +1,5 @@
 from functools import partial
 import logging
-from math import prod
 import typing as t
 import numpy
 from numpy.typing import NDArray
@@ -247,12 +246,12 @@ class ObjL1:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.object.data)
 
         cost = xp.sum(xp.abs(sim.object.data - 1.0))
-        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.shape[:-1]), dtype=cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
         return (cost * cost_scale * self.cost, state)
 
 
@@ -269,13 +268,13 @@ class ObjL2:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.object.data)
 
         cost = xp.sum(abs2(sim.object.data - 1.0))
 
-        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.shape[:-1]), dtype=cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
         return (cost * cost_scale * self.cost, state)  # type: ignore
 
 
@@ -292,12 +291,12 @@ class ObjPhaseL1:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.object.data)
 
         cost = xp.sum(xp.abs(xp.angle(sim.object.data)))
-        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.shape[:-1]), dtype=cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
         return (cost * cost_scale * self.cost, state)
 
 
@@ -314,7 +313,7 @@ class ObjRecipL1:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.object.data)
 
@@ -324,7 +323,7 @@ class ObjRecipL1:
             xp.abs(fft2(xp.prod(sim.object.data, axis=0)))
         )
         # scale cost by fraction of the total reconstruction in the group
-        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.shape[:-1]), dtype=cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
@@ -343,7 +342,7 @@ class ObjTotalVariation:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.object.data)
 
@@ -357,7 +356,7 @@ class ObjTotalVariation:
         #)
         # scale cost by fraction of the total reconstruction in the group
         # TODO also scale by # of pixels or similar?
-        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.shape[:-1]), dtype=cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
@@ -375,7 +374,7 @@ class ObjTikhonov:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.object.data)
 
@@ -384,7 +383,7 @@ class ObjTikhonov:
             xp.sum(abs2(xp.diff(sim.object.data, axis=-2)))
         )
         # scale cost by fraction of the total reconstruction in the group
-        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.shape[:-1]), dtype=cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)  # type: ignore
 
@@ -402,7 +401,7 @@ class LayersTotalVariation:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.object.data)
 
@@ -411,7 +410,7 @@ class LayersTotalVariation:
 
         cost = xp.sum(xp.abs(xp.diff(sim.object.data, axis=0)))
         # scale cost by fraction of the total reconstruction in the group
-        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.shape[:-1]), dtype=cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
@@ -429,7 +428,7 @@ class LayersTikhonov:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.object.data)
 
@@ -438,7 +437,7 @@ class LayersTikhonov:
 
         cost = xp.sum(abs2(xp.diff(sim.object.data, axis=0)))
         # scale cost by fraction of the total reconstruction in the group
-        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.shape[:-1]), dtype=cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)  # type: ignore
 
@@ -456,7 +455,7 @@ class ProbePhaseTikhonov:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.probe.data)
 
@@ -466,7 +465,7 @@ class ProbePhaseTikhonov:
             xp.sum(abs2(xp.diff(phase, axis=-1))) +
             xp.sum(abs2(xp.diff(phase, axis=-2)))
         )
-        cost_scale = 1.0
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
@@ -484,7 +483,7 @@ class ProbeRecipTikhonov:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.probe.data)
         probe_recip = xp.fft.fftshift(fft2(sim.probe.data), axes=(-1, -2))
@@ -493,7 +492,7 @@ class ProbeRecipTikhonov:
             xp.sum(abs2(xp.diff(probe_recip, axis=-1))) +
             xp.sum(abs2(xp.diff(probe_recip, axis=-2)))
         )
-        cost_scale = 1.0
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
@@ -512,14 +511,14 @@ class ProbeRecipTotalVariation:
         return None
 
     def calc_loss_group(
-        self, group: NDArray[numpy.integer], sim: ReconsState, state: None
+        self, group: NDArray[numpy.integer], sim: ReconsState, state: None, total_npos: int,
     ) -> t.Tuple[Float, None]:
         xp = get_array_module(sim.probe.data)
         probe_recip = xp.fft.fftshift(fft2(sim.probe.data), axes=(-1, -2))
 
         g_y, g_x = img_grad(probe_recip)
         cost = xp.sum(xp.sqrt(abs2(g_y) + abs2(g_x) + self.eps))
-        cost_scale = 1.0
+        cost_scale = xp.array(group.shape[-1] / total_npos, dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
