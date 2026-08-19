@@ -430,6 +430,7 @@ def run_group(
         *extract_vars(state, vars, group),
         group=group, props=props, group_patterns=group_patterns, pattern_mask=pattern_mask,
         noise_model=noise_model, regularizers=regularizers, solver_states=solver_states,
+        probe_int=probe_int, scan_density=scan_density,
         xp=xp, dtype=dtype, jit_unroll_slices=jit_unroll_slices
     )
     # scale gradients appropriately (mirrors CuPy reference's gradcalc.py normalization,
@@ -473,6 +474,28 @@ def run_group(
     return (state, losses, iter_grads, solver_states)
 
 
+def _regularizer_compensation(
+    params: t.AbstractSet[ReconsVar],
+    probe_int: t.Union[float, numpy.floating],
+    npix: t.Union[int, numpy.integer],
+    scan_density: t.Union[float, numpy.floating],
+) -> t.Union[float, numpy.floating]:
+    """Factor a regularizer's loss must be pre-multiplied by so that, after
+    `run_group`'s post-hoc grad-scaling division (probe_int / npix / scan_density --
+    see the comment there), its *effective* strength relative to the now-normalized
+    detector loss stays invariant to those same things, rather than drifting whenever
+    probe/data intensity, `sim_shape`, or scan step size change. Mirrors exactly what
+    that division applies to whichever variable(s) `params` says the regularizer
+    perturbs (only 'object' and 'probe' are meaningful here today).
+    """
+    compensation = npix / _NPIX_REFERENCE
+    if 'probe' not in params:
+        compensation = compensation * probe_int
+    if 'object' in params:
+        compensation = compensation * scan_density
+    return compensation
+
+
 @partial(
     jit,
     static_argnames=('xp', 'dtype', 'noise_model', 'regularizers', 'jit_unroll_slices'),
@@ -488,6 +511,8 @@ def run_model(
     noise_model: NoiseModel[t.Any],
     regularizers: t.Sequence[CostRegularizer[t.Any]],
     solver_states: SolverStates,
+    probe_int: t.Union[float, numpy.floating],
+    scan_density: t.Union[float, numpy.floating],
     xp: t.Any,
     dtype: t.Type[numpy.floating],
     jit_unroll_slices: t.Union[int, bool],
@@ -528,10 +553,12 @@ def run_model(
 
     losses: t.Dict[str, Float] = {'detector_loss': loss}
 
+    npix = pattern_mask.shape[-2] * pattern_mask.shape[-1]
     for (reg_i, reg) in enumerate(regularizers):
         (reg_loss, solver_states.regularizer_states[reg_i]) = reg.calc_loss_group(
             group, sim, solver_states.regularizer_states[reg_i]
         )
+        reg_loss = reg_loss * _regularizer_compensation(reg.params, probe_int, npix, scan_density)
         losses[reg.name()] = reg_loss
         loss += reg_loss
 

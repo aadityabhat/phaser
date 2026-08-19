@@ -11,6 +11,7 @@ from phaser.utils.num import (
 )
 from phaser.utils.image import convolve1d
 from phaser.state import ReconsState
+from phaser.types import ReconsVar
 from phaser.hooks.regularization import (
     ClampObjectAmplitudeProps, LimitProbeSupportProps, NonNegObjectPhaseProps,
     RegularizeLayersProps, ObjLowPassProps, GaussianProps,
@@ -236,6 +237,7 @@ class ObjGaussian:
 class ObjL1:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'object'})
 
     @staticmethod
     def name() -> str:
@@ -257,6 +259,7 @@ class ObjL1:
 class ObjL2:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: Float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'object'})
 
     @staticmethod
     def name() -> str:
@@ -279,6 +282,7 @@ class ObjL2:
 class ObjPhaseL1:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'object'})
 
     @staticmethod
     def name() -> str:
@@ -300,6 +304,7 @@ class ObjPhaseL1:
 class ObjRecipL1:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'object'})
 
     @staticmethod
     def name() -> str:
@@ -328,6 +333,7 @@ class ObjTotalVariation:
     def __init__(self, args: None, props: TVRegularizerProps):
         self.cost: float = props.cost
         self.eps: float = props.eps
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'object'})
 
     @staticmethod
     def name() -> str:
@@ -359,6 +365,7 @@ class ObjTotalVariation:
 class ObjTikhonov:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'object'})
 
     @staticmethod
     def name() -> str:
@@ -385,6 +392,7 @@ class ObjTikhonov:
 class LayersTotalVariation:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'object'})
 
     @staticmethod
     def name() -> str:
@@ -411,6 +419,7 @@ class LayersTotalVariation:
 class LayersTikhonov:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'object'})
 
     @staticmethod
     def name() -> str:
@@ -437,6 +446,7 @@ class LayersTikhonov:
 class ProbePhaseTikhonov:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'probe'})
 
     @staticmethod
     def name() -> str:
@@ -464,6 +474,7 @@ class ProbePhaseTikhonov:
 class ProbeRecipTikhonov:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'probe'})
 
     @staticmethod
     def name() -> str:
@@ -491,6 +502,7 @@ class ProbeRecipTotalVariation:
     def __init__(self, args: None, props: TVRegularizerProps):
         self.cost: float = props.cost
         self.eps: float = props.eps
+        self.params: t.FrozenSet[ReconsVar] = frozenset({'probe'})
 
     @staticmethod
     def name() -> str:

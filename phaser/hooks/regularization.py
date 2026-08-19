@@ -2,7 +2,7 @@ import typing as t
 import numpy
 from numpy.typing import NDArray
 
-from phaser.types import Dataclass
+from phaser.types import Dataclass, ReconsVar
 from . import Hook
 
 from .solver import HasState, StateT
@@ -26,6 +26,13 @@ class IterConstraint(HasState[StateT], t.Protocol[StateT]):
 
 @t.runtime_checkable
 class CostRegularizer(HasState[StateT], t.Protocol[StateT]):
+    #: which reconstruction variable(s) this regularizer's loss perturbs the gradient
+    #: of -- used to apply the same probe-intensity/npix/scan-density compensation the
+    #: detector loss gets (see `phaser.engines.gradient.run._regularizer_compensation`),
+    #: so a regularizer's effective strength stays invariant to those, matching the
+    #: gradient calculation's invariances rather than drifting when they change.
+    params: t.FrozenSet[ReconsVar]
+
     def name(self) -> str:
         ...
 

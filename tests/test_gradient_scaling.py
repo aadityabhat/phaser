@@ -163,6 +163,7 @@ def test_run_group_position_grad_matches_manual_normalization():
         *extract_vars(state, {'positions'}, group),
         group=group, props=None, group_patterns=patterns, pattern_mask=mask,
         noise_model=noise_model, regularizers=(), solver_states=SolverStates(None, [], [], []),
+        probe_int=1.0, scan_density=1.0,
         xp=jnp, dtype=numpy.float64, jit_unroll_slices=False,
     )
 
@@ -186,6 +187,7 @@ def test_run_group_object_grad_matches_manual_normalization():
         *extract_vars(state, {'object'}, group),
         group=group, props=None, group_patterns=patterns, pattern_mask=mask,
         noise_model=noise_model, regularizers=(), solver_states=SolverStates(None, [], [], []),
+        probe_int=1.0, scan_density=1.0,
         xp=jnp, dtype=numpy.float64, jit_unroll_slices=False,
     )
 

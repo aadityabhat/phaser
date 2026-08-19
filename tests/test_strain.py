@@ -69,6 +69,7 @@ def _loss(state, patterns, mask, noise_model, solver_states, group, vars_dict):
         vars_dict, state, group=group, props=None,
         group_patterns=patterns, pattern_mask=mask,
         noise_model=noise_model, regularizers=(), solver_states=solver_states,
+        probe_int=1.0, scan_density=1.0,
         xp=jnp, dtype=numpy.float64, jit_unroll_slices=False,
     )
     return loss
@@ -202,6 +203,7 @@ def test_strain_perturbation_preserves_object_dtype():
         {'distortion': eps}, state, group=group, props=props,
         group_patterns=patterns, pattern_mask=mask,
         noise_model=noise_model, regularizers=(), solver_states=solver_states,
+        probe_int=1.0, scan_density=1.0,
         xp=jnp, dtype=numpy.float32, jit_unroll_slices=False,
     )
     assert numpy.isfinite(float(loss))
