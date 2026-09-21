@@ -24,7 +24,9 @@ from phaser.state import ObjectState, ProbeState, ReconsState, IterState
 from phaser.plan import AmplitudeNoisePlan
 from phaser.engines.common.noise_models import AmplitudeNoiseModel
 from phaser.engines.gradient.run import run_model, SolverStates
-from phaser.engines.common.strain import StrainDistortionSolver, StrainDistortionSolverProps, strain_perturbation
+from phaser.engines.common.strain import (
+    StrainDistortionSolver, StrainDistortionSolverProps, strain_perturbation, _scattered_kernel_regression,
+)
 from phaser.engines.common.simulation import make_propagators
 import phaser.utils.tree as tree
 
@@ -207,3 +209,41 @@ def test_strain_perturbation_preserves_object_dtype():
         xp=jnp, dtype=numpy.float32, jit_unroll_slices=False,
     )
     assert numpy.isfinite(float(loss))
+
+
+# ---- _scattered_kernel_regression (2026-09-21 rewrite: Nadaraya-Watson kernel      ----
+# ---- regression + backward pull-warp, replacing linear-inside-hull/forward-warp)   ----
+
+def test_kernel_regression_symmetric_input_gives_symmetric_output():
+    """Regression test for anchor/off-by-one correctness (see strain.py's module
+    docstring -- CuPy's own rewrite had a real 1px anchoring bug in the equivalent
+    step). A D4-symmetric input (4 points of equal value, placed symmetrically about
+    the grid center) must produce a D4-symmetric output grid on any correctly-indexed
+    splat -- a directional indexing bug (e.g. floor vs. floor+1 applied asymmetrically)
+    would break this even though it wouldn't be visible in an all-zero/no-op case."""
+    grid = (9, 9)
+    points = numpy.array([[2.0, 2.0], [2.0, 6.0], [6.0, 2.0], [6.0, 6.0]])
+    values = numpy.array([1.0, 1.0, 1.0, 1.0])
+
+    result = numpy.asarray(_scattered_kernel_regression(points, values, grid, min_neighbors=2))
+
+    numpy.testing.assert_allclose(result, result[::-1, :], atol=1e-10)
+    numpy.testing.assert_allclose(result, result[:, ::-1], atol=1e-10)
+    numpy.testing.assert_allclose(result, result.T, atol=1e-10)
+    # and it should actually be spatially structured, not degenerately constant --
+    # points near the grid edge (far from all 4 sources) see much less density.
+    assert result[0, 0] < result[2, 2]
+
+
+def test_kernel_regression_numpy_and_jax_agree():
+    rng = numpy.random.default_rng(3)
+    grid = (10, 10)
+    points = rng.uniform(1, 8, (12, 2))
+    values = rng.normal(size=(12, 3))
+
+    result_numpy = numpy.asarray(_scattered_kernel_regression(points, values, grid, min_neighbors=3))
+    result_jax = numpy.asarray(
+        _scattered_kernel_regression(jnp.array(points), jnp.array(values), grid, min_neighbors=3)
+    )
+
+    numpy.testing.assert_allclose(result_numpy, result_jax, atol=1e-6, rtol=1e-5)

@@ -88,6 +88,25 @@ class NonNegObjectPhaseProps(Dataclass):
     weight: float = 1.0
 
 
+class PropagatorMuClampProps(Dataclass):
+    mu_max: float = 4.0
+    """Upper bound on propagator_mu (attenuation exp(-mu)), matching CuPy's mu_floor = exp(-4)
+    lower bound on |p['p']|."""
+
+
+class NonNegBackgroundProps(Dataclass):
+    eps: float = 0.5
+    """Smoothing scale for the soft floor a_floor(x, eps) = 0.5*(x + sqrt(x^2+eps^2))."""
+
+
+class ProbeIntensityCapProps(Dataclass):
+    ...
+
+
+class BackgroundIntensityCapProps(Dataclass):
+    ...
+
+
 class IterConstraintHook(Hook[None, IterConstraint]):
     known = {
         'clamp_object_amplitude': ('phaser.engines.common.regularizers:ClampObjectAmplitude', ClampObjectAmplitudeProps),
@@ -99,7 +118,10 @@ class IterConstraintHook(Hook[None, IterConstraint]):
         'tilt_gaussian': ('phaser.engines.common.regularizers:UnstructuredGaussian', TiltGaussianProps),
         'remove_phase_ramp': ('phaser.engines.common.regularizers:RemovePhaseRamp', t.Dict[str, t.Any]),
         'nonneg_object_phase': ('phaser.engines.common.regularizers:NonNegObjectPhase', NonNegObjectPhaseProps),
-
+        'propagator_mu_clamp': ('phaser.engines.common.detector_constraints:PropagatorMuClamp', PropagatorMuClampProps),
+        'nonneg_background': ('phaser.engines.common.detector_constraints:NonNegBackground', NonNegBackgroundProps),
+        'probe_intensity_cap': ('phaser.engines.common.detector_constraints:ProbeIntensityCap', ProbeIntensityCapProps),
+        'background_intensity_cap': ('phaser.engines.common.detector_constraints:BackgroundIntensityCap', BackgroundIntensityCapProps),
     }
 
 

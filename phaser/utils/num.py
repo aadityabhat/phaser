@@ -1103,6 +1103,40 @@ def at(arr: NDArray[DTypeT], idx: IndexLike) -> _AtImpl[DTypeT]:
     return _AtImpl(arr, idx)
 
 
+def scatter_add(
+    shape: t.Tuple[int, ...], idx: IndexLike, values: NDArray[DTypeT], *,
+    dtype: t.Optional[DTypeLike] = None,
+) -> NDArray[DTypeT]:
+    """Duplicate-safe scatter-add: `out[idx] += values`, correctly accumulating when `idx`
+    repeats a target multiple times (e.g. many scan positions splatting onto the same object
+    pixel). NOT the same as `at(xp.zeros(shape), idx).add(values)` -- that's only duplicate-safe
+    on JAX; on numpy/cupy/torch, plain fancy-index `+=` silently drops all but one contribution
+    per repeated index, which is why CuPy's own reference pipeline has a dedicated
+    `backend.scatter_add` rather than using `+=`.
+    """
+    xp = get_array_module(values)
+    out_dtype = values.dtype if dtype is None else dtype
+
+    if is_jax(values) and not t.TYPE_CHECKING:
+        return xp.zeros(shape, dtype=out_dtype).at[idx].add(values)
+
+    if is_torch(values) and not t.TYPE_CHECKING:
+        out = xp.zeros(shape, dtype=out_dtype, device=values.device)
+        idx = idx if isinstance(idx, tuple) else (idx,)
+        out.index_put_(tuple(idx), values, accumulate=True)
+        return out
+
+    if is_cupy(values) and not t.TYPE_CHECKING:
+        import cupyx
+        out = xp.zeros(shape, dtype=out_dtype)
+        cupyx.scatter_add(out, idx, values)
+        return out
+
+    out = numpy.zeros(shape, dtype=out_dtype)
+    numpy.add.at(out, idx, values)
+    return out
+
+
 __all__ = [
     'get_backend_module', 'get_default_backend',
     'get_devices', 'repr_device', 'to_device', 'get_backend_devices', 'set_default_device',
@@ -1113,6 +1147,6 @@ __all__ = [
     'to_complex_dtype', 'to_real_dtype',
     'fft2', 'ifft2', 'fft2shift', 'ifft2shift',
     'abs2', 'split_array', 'unstack',
-    'at', 'ufunc_outer', 'check_finite', 'brake',
+    'at', 'scatter_add', 'ufunc_outer', 'check_finite', 'brake',
     'Sampling', 'IndexLike',
 ]

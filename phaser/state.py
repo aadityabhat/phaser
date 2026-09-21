@@ -149,6 +149,11 @@ class ReconsState:
     """Scan coordinates (y, x), in length units. Shape (..., 2)"""
     tilt: t.Optional[NDArray[numpy.floating]] = None
     """Tilt angles (y, x) per scan position, in mrad. Shape (..., 2)"""
+    background: t.Optional[NDArray[numpy.floating]] = None
+    """Incoherent background added to the modeled detector intensity. Shape (y, x), same grid as probe."""
+    propagator_mu: t.Optional[NDArray[numpy.floating]] = None
+    """Learned propagator absorption: attenuates every slice-transition propagator by exp(-mu).
+    Shape (y, x), same grid as probe (reciprocal space)."""
     progress: t.Dict[str, ProgressState] = field(default_factory=dict)
 
     def to_xp(self, xp: t.Any) -> Self:
@@ -158,6 +163,8 @@ class ReconsState:
             object=self.object.to_xp(xp),
             scan=xp.asarray(self.scan),
             tilt=None if self.tilt is None else xp.asarray(self.tilt),
+            background=None if self.background is None else xp.asarray(self.background),
+            propagator_mu=None if self.propagator_mu is None else xp.asarray(self.propagator_mu),
             progress=self.progress,
             wavelength=self.wavelength,
         )
@@ -169,6 +176,8 @@ class ReconsState:
             object=self.object.to_numpy(),
             scan=to_numpy(self.scan),
             tilt=None if self.tilt is None else to_numpy(self.tilt),
+            background=None if self.background is None else to_numpy(self.background),
+            propagator_mu=None if self.propagator_mu is None else to_numpy(self.propagator_mu),
             progress=self.progress,
             wavelength=float(self.wavelength),
         )
@@ -197,6 +206,8 @@ class PartialReconsState:
     scan: t.Optional[NDArray[numpy.floating]] = None
     """Scan coordinates (y, x), in length units. Shape (..., 2)"""
     tilt: t.Optional[NDArray[numpy.floating]] = None
+    background: t.Optional[NDArray[numpy.floating]] = None
+    propagator_mu: t.Optional[NDArray[numpy.floating]] = None
     progress: t.Optional[t.Dict[str, ProgressState]] = None
 
     def to_numpy(self) -> Self:
@@ -206,6 +217,8 @@ class PartialReconsState:
             object=self.object.to_numpy() if self.object is not None else None,
             scan=to_numpy(self.scan) if self.scan is not None else None,
             tilt=to_numpy(self.tilt) if self.tilt is not None else None,
+            background=to_numpy(self.background) if self.background is not None else None,
+            propagator_mu=to_numpy(self.propagator_mu) if self.propagator_mu is not None else None,
             wavelength=float(self.wavelength) if self.wavelength is not None else None,
             progress=self.progress,
         )
@@ -223,7 +236,8 @@ class PartialReconsState:
             probe=t.cast(ProbeState, self.probe),
             object=t.cast(ObjectState, self.object),
             scan=t.cast(NDArray[numpy.floating], self.scan),
-            tilt=self.tilt, progress=progress, iter=iter,
+            tilt=self.tilt, background=self.background, propagator_mu=self.propagator_mu,
+            progress=progress, iter=iter,
         )
 
     def write_hdf5(self, file: 'HdfLike'):

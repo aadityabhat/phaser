@@ -124,7 +124,7 @@ def _object_grad_via_recording_solver(state, patterns, mask, noise_model, group,
         group_constraint_states=[],
     )
     iter_grads = tree.zeros_like(extract_vars(state, frozenset(), group)[0])
-    losses = {'detector_loss': xp.array(0.0), 'total_loss': xp.array(0.0), **{reg.name(): xp.array(0.0) for reg in regularizers}}
+    losses = {'detector_loss': xp.array(0.0), 'total_loss': xp.array(0.0), 'coh_total': xp.array(0.0), **{reg.name(): xp.array(0.0) for reg in regularizers}}
 
     (_, _, _, solver_states) = run_group(
         state, group=group, vars=frozenset({'object'}),
@@ -246,7 +246,7 @@ def _probe_grad_via_recording_solver(state, patterns, mask, noise_model, group, 
         group_constraint_states=[],
     )
     iter_grads = tree.zeros_like(extract_vars(state, frozenset(), group)[0])
-    losses = {'detector_loss': xp.array(0.0), 'total_loss': xp.array(0.0), **{r.name(): xp.array(0.0) for r in regularizers}}
+    losses = {'detector_loss': xp.array(0.0), 'total_loss': xp.array(0.0), 'coh_total': xp.array(0.0), **{r.name(): xp.array(0.0) for r in regularizers}}
     (_, _, _, solver_states) = run_group(
         state, group=group, vars=frozenset({'probe'}),
         noise_model=noise_model, group_solvers=(solver,), group_constraints=(), regularizers=regularizers,

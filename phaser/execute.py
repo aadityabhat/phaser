@@ -9,7 +9,7 @@ import numpy
 import pane
 
 from phaser.types import EarlyTermination
-from phaser.utils.num import Device, cast_array_module, get_array_module, get_backend_devices, get_backend_module, set_default_device, to_device, xp_is_jax, Sampling, to_complex_dtype, xp_is_torch
+from phaser.utils.num import Device, cast_array_module, get_array_module, get_backend_devices, get_backend_module, set_default_device, to_device, xp_is_jax, Sampling, to_complex_dtype, to_real_dtype, xp_is_torch
 from phaser.utils.object import ObjectSampling
 from phaser.utils.misc import unwrap
 from .hooks import EngineHook, Hook, ObjectHook, RawData
@@ -448,6 +448,12 @@ def prepare_for_engine(patterns: Patterns, state: ReconsState, xp: t.Any, engine
         if 'tilt' in solver_vars and state.tilt is None:
             logging.info("Creating new, zeroed tilt map...")
             state.tilt = xp.zeros_like(state.scan)
+        if 'background' in solver_vars and state.background is None:
+            logging.info("Creating new, zeroed incoherent background...")
+            state.background = xp.zeros(state.probe.data.shape[-2:], dtype=to_real_dtype(state.probe.data.dtype))
+        if 'propagator_mu' in solver_vars and state.propagator_mu is None:
+            logging.info("Creating new, zeroed propagator absorption (mu)...")
+            state.propagator_mu = xp.zeros(state.probe.data.shape[-2:], dtype=to_real_dtype(state.probe.data.dtype))
 
     return patterns, state
 

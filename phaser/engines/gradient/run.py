@@ -27,6 +27,10 @@ from ..common.strain import strain_perturbation
 
 logger = logging.getLogger(__name__)
 _PER_ITER_VARS: t.FrozenSet[ReconsVar] = frozenset({'positions', 'tilt', 'distortion'})
+# Detector-plane vars whose sensitivity isn't mediated by the multiplicative probe-amplitude
+# chain the way object/positions/tilt/distortion's is -- like 'probe', excluded from the
+# probe_int normalization below (see run_group's grad-scaling loop and _regularizer_compensation).
+_PROBE_LIKE_VARS: t.FrozenSet[ReconsVar] = frozenset({'probe', 'background', 'propagator_mu'})
 # Reference pixel count for the npix gradient normalization below. CuPy's reference
 # implementation (gradcalc.py) bakes similar magic constants (256, 32, 4, ...) around
 # its own step-size conventions purely to keep gradients in a convenient numeric range;
@@ -47,6 +51,22 @@ _NPIX_REFERENCE: int = 192 * 192
 # need to be re-derived from scratch for that config, only when it changes.
 _PROBE_INT_REFERENCE: float = 1.6685e5
 _SCAN_DENSITY_REFERENCE: float = 5.5435e3
+# Reference groups-per-iteration (total_npos / grouping), for group_solvers (object,
+# probe -- anything NOT in _PER_ITER_VARS). Unlike probe_int/npix/scan_density, this
+# one can't be fixed by scaling the *gradient* Adam receives: Adam's own second-moment
+# normalization already makes it roughly invariant to a uniform rescale of its input,
+# so dividing the gradient by more/fewer groups-per-iteration doesn't change the size
+# of the *step* Adam actually takes. What does change with total_npos/grouping is how
+# many such steps get applied per logged iteration -- group_solvers run once per group,
+# every group, every iteration (unlike positions/distortion, which accumulate across
+# groups and apply exactly one step per iteration regardless of grouping) -- so more
+# groups per iteration means more sequential optimizer steps compounding together,
+# observed to cause real instability at a much larger scan (65536 positions, 1024
+# groups/iter at grouping=64) that a smaller/cropped scan (10000 positions, ~156
+# groups/iter) didn't show. Calibrated to that smaller scan's groups-per-iteration
+# (10000 / 64), and applied as a post-solver scale on each group_solver's *output*
+# update (not its input gradient), which is what actually shrinks step size.
+_GROUPS_PER_ITER_REFERENCE: float = 10000 / 64
 
 
 def process_solvers(
@@ -92,7 +112,9 @@ _PATH_MAP: t.Dict[t.Tuple[str, ...], ReconsVar] = {
     ('object', 'data'): 'object',
     ('probe', 'data'): 'probe',
     ('scan',): 'positions',
-    ('tilt',): 'tilt'
+    ('tilt',): 'tilt',
+    ('background',): 'background',
+    ('propagator_mu',): 'propagator_mu',
 }
 
 def _normalize_path(path: t.Tuple[tree.GetAttrKey, ...]) -> t.Tuple[str, ...]:
@@ -143,6 +165,10 @@ def apply_update(state: ReconsState, update: t.Dict[ReconsVar, numpy.ndarray]) -
         state.object.data += update['object']
     if 'tilt' in update:
         state.tilt += update['tilt']
+    if 'background' in update:
+        state.background += update['background']
+    if 'propagator_mu' in update:
+        state.propagator_mu += update['propagator_mu']
     if 'positions' in update:
         # subtract mean position update
         xp = get_array_module(update['positions'])
@@ -232,6 +258,8 @@ def run_engine(args: EngineArgs, props: GradientEnginePlan) -> ReconsState:
         'positions': process_flag(props.update_positions),
         'tilt': process_flag(props.update_tilt),
         'distortion': process_flag(props.update_distortion),
+        'background': process_flag(props.update_background),
+        'propagator_mu': process_flag(props.update_propagator_mu),
     }
     # shuffle_groups defaults to True for sparse groups, False for compact groups
     shuffle_groups = process_flag(props.shuffle_groups or not props.compact)
@@ -268,15 +296,22 @@ def run_engine(args: EngineArgs, props: GradientEnginePlan) -> ReconsState:
 
     # runs rescaling
     rescale_factors = []
+    patterns_total = xp.zeros((), dtype=dtype)
     for (group_i, (group, group_patterns)) in enumerate(iter_patterns(groups.iter(state.scan))):
         group_rescale_factors = dry_run(
             state, group, propagators, group_patterns,
             xp=xp, dtype=dtype,
         )
         rescale_factors.append(group_rescale_factors)
+        # accumulated here (rather than a second pass over patterns) purely because this loop
+        # already streams every pattern once -- see M_bar's use in ProbeIntensityCap/
+        # BackgroundIntensityCap (phaser.engines.common.detector_constraints), the same role
+        # CuPy's `M_bar`/`I_b_target` play in optimize.py.
+        patterns_total = patterns_total + xp.sum(group_patterns)
 
     rescale_factors = xp.concatenate(rescale_factors, axis=0)
     rescale_factor = xp.mean(rescale_factors)
+    M_bar = patterns_total / groups.n_pos
 
     logger.info("Pre-calculated intensities")
     logger.info(f"Rescaling initial probe intensity by {float(rescale_factor):.2e}")
@@ -284,18 +319,27 @@ def run_engine(args: EngineArgs, props: GradientEnginePlan) -> ReconsState:
     probe_int = xp.sum(abs2(state.probe.data))
     scan_density = compute_scan_density(state, xp, dtype)
     logger.info(
-        f"probe_int: {float(probe_int):.4e}, scan_density: {float(scan_density):.4e} "
+        f"probe_int: {float(probe_int):.4e}, scan_density: {float(scan_density):.4e}, "
+        f"M_bar: {float(M_bar):.4e} "
         f"(gradient-scaling reference values -- see _PROBE_INT_REFERENCE/_SCAN_DENSITY_REFERENCE)"
     )
 
     observer.start_engine(state)
+
+    # opt-in data-context injection for constraints that need a data-derived reference constant
+    # (e.g. ProbeIntensityCap/BackgroundIntensityCap in phaser.engines.common.detector_constraints
+    # need M_bar) -- duck-typed rather than a protocol change, since apply_iter's (sim, state)
+    # signature has no data access and most constraints don't need any.
+    for reg in iter_constraints:
+        if hasattr(reg, 'bind_context'):
+            reg.bind_context(M_bar=M_bar, pattern_mask=pattern_mask)
 
     solver_states = SolverStates.init_state(state, xp, noise_model, group_solvers, regularizers, group_constraints)
     iter_solver_states = [solver.init_state(state) for solver in iter_solvers]
     iter_constraint_states = [reg.init_state(state) for reg in iter_constraints]
 
     loss_keys = (
-        'detector_loss', 'total_loss', *(reg.name() for reg in regularizers),
+        'detector_loss', 'total_loss', 'coh_total', *(reg.name() for reg in regularizers),
     )
     other_keys = (
         *(('pos_update_rms',) if 'positions' in all_vars else ()),
@@ -469,7 +513,7 @@ def run_group(
     for k in grad.keys():
         grad[k] /= xp.array(
             (1.0 if k in _PER_ITER_VARS else group.shape[-1])
-            * (1.0 if k == 'probe' else probe_int)
+            * (1.0 if k in _PROBE_LIKE_VARS else probe_int)
             * (npix / _NPIX_REFERENCE)
             * (scan_density / _SCAN_DENSITY_REFERENCE if k == 'object' else 1.0),
             dtype=dtype
@@ -478,6 +522,15 @@ def run_group(
     # update iter grads at group
     iter_grads = tree.map(lambda v1, v2: at(v1, tuple(group)).set(v2), iter_grads, filter_vars(grad, vars & _PER_ITER_VARS))
 
+    # group_solvers (object, probe) apply their optimizer's update once per group,
+    # every group, every iteration -- so the number of groups per iteration
+    # (total_npos / group size) controls how many sequential steps compound together
+    # within one logged iteration. Scale each solver's *output* update (not its input
+    # gradient -- see _GROUPS_PER_ITER_REFERENCE's comment for why that distinction
+    # matters) so the cumulative per-iteration displacement stays comparable to the
+    # config this was calibrated at, regardless of grouping/total scan size.
+    group_step_scale = xp.array(_group_step_scale(total_npos, group.shape[-1]), dtype=dtype)
+
     for (sol_i, solver) in enumerate(group_solvers):
         solver_grads = filter_vars(grad, solver.params)
         if len(solver_grads) == 0:
@@ -485,6 +538,7 @@ def run_group(
         (update, solver_states.group_solver_states[sol_i]) = solver.update(
             state, solver_states.group_solver_states[sol_i], solver_grads, group_losses['total_loss']
         )
+        update = tree.map(lambda u: u * group_step_scale, update)
         state = apply_update(state, update)
 
     for (reg_i, reg) in enumerate(group_constraints):
@@ -494,6 +548,20 @@ def run_group(
 
     losses = tree.map(xp.add, losses, group_losses)
     return (state, losses, iter_grads, solver_states)
+
+
+def _group_step_scale(
+    total_npos: t.Union[int, numpy.integer],
+    group_size: t.Union[int, numpy.integer],
+) -> t.Union[float, numpy.floating]:
+    """Factor a group_solver's (object/probe) *output* update gets scaled by, so
+    that its cumulative displacement per iteration (n_groups_per_iter update-sized
+    steps, one per group) stays comparable to `_GROUPS_PER_ITER_REFERENCE`'s own
+    calibration point regardless of grouping/total scan size. See
+    `_GROUPS_PER_ITER_REFERENCE`'s comment for why this has to scale the solver's
+    *output*, not its input gradient (which Adam would just absorb)."""
+    n_groups_per_iter = total_npos / group_size
+    return _GROUPS_PER_ITER_REFERENCE / n_groups_per_iter
 
 
 def _regularizer_compensation(
@@ -522,7 +590,7 @@ def _regularizer_compensation(
     constants purely calibrating its absolute magnitude.
     """
     compensation = npix / _NPIX_REFERENCE
-    if 'probe' not in params:
+    if not (params & _PROBE_LIKE_VARS):
         compensation = compensation * (probe_int / _PROBE_INT_REFERENCE)
     if 'object' in params:
         compensation = compensation * (scan_density / _SCAN_DENSITY_REFERENCE)
@@ -578,14 +646,27 @@ def run_model(
         return psi * group_obj[:, slice_i, None]
 
     t_props = tilt_propagators(ky, kx, sim, props, group_tilts)
+    if t_props is not None and sim.propagator_mu is not None:
+        # learned scattering-angle-dependent attenuation, applied uniformly to every slice
+        # transition (matches CuPy's single global p['p'] reused across all slices) -- a real
+        # multiplicative factor on the propagator's magnitude, differentiable through the same
+        # autodiff path as everything else (no hand-derived adjoint needed, unlike CuPy's
+        # gradcalc.py tp_raw accumulation).
+        t_props = t_props * xp.exp(-sim.propagator_mu)[None, None, :, :]
     model_wave = fft2(slice_forwards(t_props, probes, sim_slice, jit_unroll_slices=jit_unroll_slices), shift=False)
 
     model_intensity = xp.sum(abs2(model_wave), axis=1)
+    # unmasked, full-k-space coherent total (pre-background) -- mirrors CuPy's gradcalc.py
+    # coh_total_raw, consumed by BackgroundIntensityCap (phaser.engines.common.detector_constraints)
+    # to budget the incoherent background against power the coherent model hasn't already claimed.
+    coh_total = xp.sum(abs2(model_wave))
+    if sim.background is not None:
+        model_intensity = model_intensity + sim.background
     (loss, solver_states.noise_model_state) = noise_model.calc_loss(
         model_wave, model_intensity, group_patterns, pattern_mask, solver_states.noise_model_state
     )
 
-    losses: t.Dict[str, Float] = {'detector_loss': loss}
+    losses: t.Dict[str, Float] = {'detector_loss': loss, 'coh_total': coh_total}
 
     npix = pattern_mask.shape[-2] * pattern_mask.shape[-1]
     for (reg_i, reg) in enumerate(regularizers):

@@ -14,7 +14,8 @@ from phaser.utils.num import (
     fft2, ifft2, abs2,
     to_numpy, as_array,
     ufunc_outer,
-    pad, _PadMode
+    pad, _PadMode,
+    scatter_add,
 )
 
 
@@ -307,3 +308,38 @@ def test_pad_nd(
         to_numpy(pad(xp.array(in_arr), pad_width, mode=mode, cval=3)),
         numpy.pad(in_arr, pad_width, mode=mode, **kwargs)  # type: ignore
     )
+
+
+@with_backends('numpy', 'jax', 'cupy', 'torch')
+def test_scatter_add_accumulates_duplicate_indices(backend: BackendName):
+    """The whole point of scatter_add over `at(zeros, idx).add(values)`: repeated indices
+    must genuinely accumulate on every backend, not just JAX (see scatter_add's docstring --
+    plain fancy-index += silently drops all but one contribution per repeated index on
+    numpy/cupy/torch)."""
+    xp = get_backend_module(backend)
+
+    idx = xp.array([0, 0, 1, 2, 2, 2])
+    values = xp.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+    result = to_numpy(scatter_add((4,), (idx,), values))
+
+    assert_array_almost_equal(result, numpy.array([3.0, 3.0, 15.0, 0.0]))
+
+
+@with_backends('numpy', 'jax', 'cupy', 'torch')
+def test_scatter_add_2d_matches_numpy_add_at(backend: BackendName):
+    xp = get_backend_module(backend)
+    rng = numpy.random.default_rng(0)
+
+    n = 50
+    (ny, nx) = (6, 6)
+    yi = rng.integers(0, ny, n)
+    xi = rng.integers(0, nx, n)
+    values = rng.normal(size=n)
+
+    result = to_numpy(scatter_add((ny, nx), (xp.array(yi), xp.array(xi)), xp.array(values)))
+
+    expected = numpy.zeros((ny, nx))
+    numpy.add.at(expected, (yi, xi), values)
+
+    assert_array_almost_equal(result, expected)

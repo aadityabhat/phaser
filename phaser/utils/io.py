@@ -111,11 +111,14 @@ def hdf5_read_state(file: HdfLike) -> PartialReconsState:
 
     if tilt is not None and scan is not None:
         assert tilt.shape == scan.shape
+    background = numpy.asarray(_hdf5_read_dataset(file, 'background', numpy.float64)) if 'background' in file else None
+    propagator_mu = numpy.asarray(_hdf5_read_dataset(file, 'propagator_mu', numpy.float64)) if 'propagator_mu' in file else None
     progress = hdf5_read_progress_state(_assert_group(file['progress'])) if 'progress' in file else None
 
     return PartialReconsState(
         wavelength=wavelength, iter=iter, probe=probe,
-        object=obj, scan=scan, tilt=tilt, progress=progress
+        object=obj, scan=scan, tilt=tilt,
+        background=background, propagator_mu=propagator_mu, progress=progress
     )
 
 
@@ -143,8 +146,8 @@ def hdf5_read_object_state(group: h5py.Group) -> ObjectState:
     sampling = _hdf5_read_dataset_shape(group, 'sampling', numpy.float64, (2,))
     corner = _hdf5_read_dataset_shape(group, 'corner', numpy.float64, (2,))
 
-    region_min = _hdf5_read_dataset_shape(group, 'region_min', numpy.float64, (2,)) if 'region_min' in group else None
-    region_max = _hdf5_read_dataset_shape(group, 'region_max', numpy.float64, (2,)) if 'region_max' in group else None
+    region_min = _hdf5_read_nullable_dataset_shape(group, 'region_min', numpy.float64, (2,))
+    region_max = _hdf5_read_nullable_dataset_shape(group, 'region_max', numpy.float64, (2,))
 
     return ObjectState(
         ObjectSampling((n_y, n_x), sampling, corner, region_min, region_max),
@@ -202,6 +205,10 @@ def hdf5_write_state(state: t.Union[ReconsState, PartialReconsState], file: HdfL
         file.create_dataset('scan', data=to_numpy(state.scan).astype(numpy.float64))
     if state.tilt is not None:
         file.create_dataset('tilt', data=to_numpy(state.tilt).astype(numpy.float64))
+    if state.background is not None:
+        file.create_dataset('background', data=to_numpy(state.background).astype(numpy.float64))
+    if state.propagator_mu is not None:
+        file.create_dataset('propagator_mu', data=to_numpy(state.propagator_mu).astype(numpy.float64))
     if state.iter is not None:
         hdf5_write_iter_state(state.iter, file.create_group("iter"))
     if state.progress is not None:
@@ -304,6 +311,26 @@ def _hdf5_read_dataset_shape(group: h5py.Group, path: str, dtype: t.Type[DTypeT]
         raise ValueError(f"While reading '{group.file.filename}':\n"
                          f"Expected a dataset of shape '{shape}' at path '{group.name}{path}', instead got shape {arr.shape}.")
     return arr
+
+
+def _hdf5_read_nullable_dataset_shape(
+    group: h5py.Group, path: str, dtype: t.Type[DTypeT], shape: t.Tuple[int, ...],
+) -> t.Optional[NDArray[DTypeT]]:
+    """Like `_hdf5_read_dataset_shape`, but for a field written by
+    `_hdf5_write_nullable_dataset`: returns None both when `path` is absent (an older file
+    written before the field existed) and when it's present but holds the `h5py.Empty`
+    placeholder `_hdf5_write_nullable_dataset` writes for a None value (an h5py Empty
+    dataset reports `.shape is None` -- `dataset[()]` returns an `h5py.Empty` object, which
+    has no `.astype`, so this must be checked before delegating to the ordinary read path)."""
+    if path not in group:
+        return None
+    dataset = group[path]
+    if not isinstance(dataset, h5py.Dataset):
+        raise ValueError(f"While reading '{group.file.filename}':\n"
+                         f"Expected a dataset at path '{group.name}{path}', instead found {type(dataset)}.")
+    if dataset.shape is None:
+        return None
+    return _hdf5_read_dataset_shape(group, path, dtype, shape)
 
 
 def _hdf5_read_scalar(group: h5py.Group, path: str, dtype: t.Type[DTypeT]) -> DTypeT:

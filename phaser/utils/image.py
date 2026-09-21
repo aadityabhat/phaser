@@ -233,6 +233,36 @@ def affine_transform(
         return output
 
 
+def map_coordinates(
+    arr: NDArray[NumT],
+    coordinates: ArrayLike,
+    order: int = 1,
+    mode: _InterpBoundaryMode = 'nearest',
+    cval: t.Union[NumT, float] = 0.0,
+) -> NDArray[NumT]:
+    """Interpolate `arr` at arbitrary `coordinates` (shape `(arr.ndim, *query_shape)`), unlike
+    `affine_transform` (regular-grid resampling only). Used for scattered-data /
+    displacement-field interpolation, e.g. `phaser.engines.common.strain`'s distortion solve.
+    """
+    xp = get_array_module(arr)
+
+    if xp_is_torch(xp):
+        from ._torch_kernels import map_coordinates as _torch_map_coordinates, asarray
+        return t.cast(NDArray[NumT], _torch_map_coordinates(
+            arr, asarray(coordinates, dtype=arr.dtype), order=order, mode=mode, cval=cval,
+        ))
+
+    if xp_is_jax(xp):
+        import jax.scipy.ndimage
+        jax_mode = {'grid-constant': 'constant', 'grid-wrap': 'wrap'}.get(mode, mode)
+        return t.cast(NDArray[NumT], jax.scipy.ndimage.map_coordinates(
+            arr, tuple(xp.asarray(coordinates)), order=order, mode=jax_mode, cval=cval,
+        ))
+
+    scipy = get_scipy_module(arr, coordinates)
+    return scipy.ndimage.map_coordinates(arr, coordinates, order=order, mode=mode, cval=cval)
+
+
 def gaussian_transfer(
     ky: NDArray[numpy.floating],
     kx: NDArray[numpy.floating],

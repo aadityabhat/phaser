@@ -10,7 +10,7 @@ from .utils import with_backends, check_array_equals_file
 
 from phaser.utils.num import get_backend_module, BackendName, to_numpy, Sampling
 from phaser.utils.image import (
-    affine_transform, _InterpBoundaryMode, convolve1d
+    affine_transform, _InterpBoundaryMode, convolve1d, map_coordinates
 )
 
 
@@ -115,3 +115,24 @@ def test_convolve1d(
     assert actual.dtype == expected.dtype
 
     assert_array_almost_equal(actual, expected, decimal=6)
+
+
+@with_backends('numpy', 'jax', 'cupy', 'torch')
+@pytest.mark.parametrize('mode', ['nearest', 'grid-constant', 'grid-wrap'])
+def test_map_coordinates_matches_scipy(mode: _InterpBoundaryMode, backend: BackendName):
+    """`map_coordinates` (new -- needed by the GPU-native distortion solve in
+    `phaser.engines.common.strain`, which interpolates at arbitrary, non-affine query
+    points that `affine_transform` can't express) must agree with plain
+    `scipy.ndimage.map_coordinates` on every backend."""
+    rng = numpy.random.default_rng(0)
+    arr = rng.normal(size=(8, 10)).astype(numpy.float64)
+    coords = numpy.stack([
+        rng.uniform(-1, 9, 15),
+        rng.uniform(-1, 11, 15),
+    ])
+
+    xp = get_backend_module(backend)
+    actual = to_numpy(map_coordinates(xp.array(arr), xp.array(coords), order=1, mode=mode))
+    expected = osp.map_coordinates(arr, coords, order=1, mode=mode)
+
+    assert_array_almost_equal(actual, expected, decimal=5)

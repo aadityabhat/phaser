@@ -21,7 +21,7 @@ from phaser.state import ObjectState, ProbeState, ReconsState, IterState
 from phaser.plan import AmplitudeNoisePlan, AdamSolverPlan
 from phaser.engines.common.noise_models import AmplitudeNoiseModel
 from phaser.engines.gradient.run import (
-    run_group, extract_vars, SolverStates, compute_scan_density, _NPIX_REFERENCE,
+    run_group, run_model, extract_vars, SolverStates, compute_scan_density, _NPIX_REFERENCE,
     _SCAN_DENSITY_REFERENCE,
 )
 from phaser.engines.gradient.solvers import AdamSolver
@@ -75,7 +75,9 @@ def _run_group_for_test(state, patterns, mask, noise_model, group, vars_set, gro
         regularizer_states=[], group_constraint_states=[],
     )
     iter_grads = tree.zeros_like(extract_vars(state, vars_set & {'positions', 'tilt', 'distortion'}, group)[0])
-    losses = {'detector_loss': xp.array(0.0), 'total_loss': xp.array(0.0)}
+    # 'coh_total' is always present in run_model's losses dict now (see run.py) -- included here
+    # too so this accumulator's pytree structure matches what run_group's tree.map(xp.add, ...) expects.
+    losses = {'detector_loss': xp.array(0.0), 'total_loss': xp.array(0.0), 'coh_total': xp.array(0.0)}
 
     return run_group(
         state, group=group, vars=vars_set,
@@ -258,3 +260,62 @@ def test_adam_object_update_not_stalled_by_eps_after_normalization():
         f"object update norm {update_norm} looks eps-stalled relative to "
         f"learning_rate={props.learning_rate} over {n_elem} elements"
     )
+
+
+# ---- groups-per-iteration step-size compensation ----------------------------
+
+def test_group_step_scale_formula():
+    from phaser.engines.gradient.run import _GROUPS_PER_ITER_REFERENCE, _group_step_scale
+
+    # at the reference config itself, no-op
+    assert _group_step_scale(total_npos=10000, group_size=64) == pytest.approx(1.0)
+    # 4x more groups/iteration than the reference -> update shrunk 4x
+    scale_4x_groups = _group_step_scale(total_npos=4 * _GROUPS_PER_ITER_REFERENCE * 64, group_size=64)
+    assert scale_4x_groups == pytest.approx(0.25)
+    # fewer groups/iteration than the reference -> update grown proportionally
+    scale_half_groups = _group_step_scale(total_npos=0.5 * _GROUPS_PER_ITER_REFERENCE * 64, group_size=64)
+    assert scale_half_groups == pytest.approx(2.0)
+
+
+def test_group_solver_update_matches_manual_scale():
+    """Wiring check (mirrors test_run_group_object_grad_matches_manual_normalization):
+    run_group's applied object update must equal what calling the solver directly
+    (with the same grad) produces, times _group_step_scale(total_npos, group.shape[-1])
+    -- confirming the scale is actually multiplied into the solver's *output*, not
+    just present as an unused formula."""
+    from phaser.engines.gradient.run import _group_step_scale
+
+    (state, patterns, mask, noise_model, group, npos) = _make_toy_problem(npos=8, by=8, bx=8)
+    props = AdamSolverPlan(learning_rate=1e-2)
+
+    # compute the raw grad run_group would see, exactly as run_group does
+    (raw_grad, _aux) = tree.grad(run_model, has_aux=True, xp=jnp, sign=-1)(
+        *extract_vars(state, {'object'}, group),
+        group=group, props=None, group_patterns=patterns, pattern_mask=mask,
+        noise_model=noise_model, regularizers=(), solver_states=SolverStates(None, [], [], []),
+        probe_int=1.0, scan_density=1.0, total_npos=npos,
+        xp=jnp, dtype=numpy.float64, jit_unroll_slices=False,
+    )
+    from phaser.utils.num import abs2
+    probe_int = jnp.sum(abs2(state.probe.data))
+    npix = mask.shape[-2] * mask.shape[-1]
+    scan_density = compute_scan_density(state, jnp, numpy.float64)
+    normalized_grad = raw_grad['object'] / (group.shape[-1] * probe_int * (npix / _NPIX_REFERENCE) * (scan_density / _SCAN_DENSITY_REFERENCE))
+
+    # apply the solver directly to the normalized grad (same inputs run_group's
+    # solver.update() call would receive), independent of run_group entirely
+    solver_direct = AdamSolver({'plan': None, 'params': frozenset({'object'})}, props)
+    direct_state = solver_direct.update_for_iter(state, solver_direct.init_state(state), 1)
+    (direct_update, _) = solver_direct.update(state, direct_state, {'object': normalized_grad}, 0.0)
+    expected_scale = _group_step_scale(npos, group.shape[-1])
+    expected_update = numpy.asarray(direct_update['object']) * expected_scale
+
+    # now get what run_group actually applied
+    solver_via_run_group = AdamSolver({'plan': None, 'params': frozenset({'object'})}, props)
+    orig_object_data = numpy.array(state.object.data)
+    (new_state, _, _, _) = _run_group_for_test(
+        state, patterns, mask, noise_model, group, {'object'}, group_solvers=(solver_via_run_group,),
+    )
+    actual_update = numpy.array(new_state.object.data) - orig_object_data
+
+    numpy.testing.assert_allclose(actual_update, expected_update, rtol=1e-5, atol=1e-10)

@@ -78,6 +78,8 @@ class EnginePlan(Dataclass, kw_only=True):
     update_positions: FlagLike = False
     update_tilt: FlagLike = False
     update_distortion: FlagLike = False
+    update_background: FlagLike = False
+    update_propagator_mu: FlagLike = False
 
     calc_error: FlagLike = SimpleFlag(every=1)
     calc_error_fraction: float = 0.1

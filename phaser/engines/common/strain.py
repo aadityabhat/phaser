@@ -13,9 +13,21 @@ Two halves, matching the paper:
 
 2. `StrainDistortionSolver` -- a `GradientSolver` with params={'distortion'} that
    consumes the accumulated (npos, 4) strain gradient once per iteration and produces
-   {'object', 'positions'} updates via a Fourier-Laplacian-inversion Poisson solve
-   (ported near-verbatim from distort.py, CPU/SciPy -- no JAX/torch equivalent for the
-   scattered/gridded interpolation steps).
+   {'object', 'positions'} updates via a Fourier-Laplacian-inversion Poisson solve.
+
+`solve_distortion` (2026-09-21 rewrite, matching CuPy's own `distort.py` rewrite of the same
+period): scattered strain samples are smoothed onto the object grid via Nadaraya-Watson kernel
+regression (`_scattered_kernel_regression`) rather than a linear-inside-hull/zero-outside fit --
+the old fit's hard discontinuity at the scan-hull boundary rang through the Poisson solve below (a
+global, periodic-FFT operation) and damaged the object near the edge of the scanned region. The
+object update is a backward/"pull" warp with fixed-point refinement (`_pull_warp_object`) rather
+than a forward/"push" scatter-and-retriangulate, which broke down near sharp object features even
+for the small per-iteration displacements actually seen in production. Both fixes ported from
+CuPy's `recon_12slices/ptycho/distort.py`; see that module's docstring for the original
+derivation/validation. Runs entirely on the active `xp` backend (JAX/CuPy/Torch/NumPy) via
+`phaser.utils.num.scatter_add`/`phaser.utils.image.map_coordinates` -- no CPU round-trip, unlike
+the version this replaced (which had no cross-backend equivalent for the old
+LinearNDInterpolator-based scatter).
 
 Note on sign: `tree.grad(..., sign=-1)` (used by `run_group` to extract iter_grads)
 already returns the *descent direction*, not the raw dLoss/deps -- so
@@ -28,7 +40,8 @@ import numpy
 from numpy.typing import NDArray
 
 from phaser.types import Dataclass
-from phaser.utils.num import brake, get_array_module, to_real_dtype, to_numpy
+from phaser.utils.num import brake, get_array_module, to_real_dtype, at, scatter_add, fft2, ifft2
+from phaser.utils.image import map_coordinates
 from phaser.hooks.solver import GradientSolver, GradientSolverArgs
 
 if t.TYPE_CHECKING:
@@ -102,101 +115,244 @@ def strain_perturbation(
     return delta.astype(obj.data.dtype)
 
 
-def _scattered_linear_zero_fill(points: NDArray, values: NDArray, query: NDArray) -> NDArray:
-    """Linear inside the convex hull of `points`, zero outside."""
-    from scipy.interpolate import LinearNDInterpolator
-    result = LinearNDInterpolator(points, values, fill_value=numpy.nan)(query)
-    return numpy.nan_to_num(result, nan=0.0)
+def _max_kth_nn_dist(points: NDArray[numpy.floating], k: int, batch_size: int = 4096) -> t.Any:
+    """Distance to each point's k-th nearest OTHER point, maxed over all points -- the data-driven
+    bandwidth `_scattered_kernel_regression` uses (ported from CuPy's `distort.py`
+    `_max_kth_nn_dist`, itself a GPU-portable replacement for `scipy.spatial.cKDTree`). Brute-force
+    over batches of query points (O(n^2) total, trivial at the ~1e4-1e5 scan-position counts this
+    is used for); uses `xp.sort` rather than CuPy's `xp.partition` for broader backend support
+    (JAX/torch don't universally expose partition) -- O(n log n) instead of O(n), immaterial here.
+    Runs eagerly (this whole module is called outside any `@jit`), so plain Python looping over
+    `n`/`batch_size` is safe even under JAX.
+    """
+    xp = get_array_module(points)
+    n = points.shape[0]
+    sq_norms = xp.sum(points ** 2, axis=1)
+    max_kth_sq = xp.asarray(0.0, dtype=points.dtype)
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        chunk = points[start:stop]
+        d2 = sq_norms[start:stop][:, None] + sq_norms[None, :] - 2.0 * (chunk @ points.T)
+        d2 = xp.maximum(d2, 0.0)
+        kth_sq = xp.sort(d2, axis=1)[:, k]
+        max_kth_sq = xp.maximum(max_kth_sq, xp.max(kth_sq))
+    return xp.sqrt(max_kth_sq)
 
 
-def _gridded_linear_nearest_extrap(grid_axes: t.Tuple[NDArray, NDArray], values: NDArray, query: NDArray) -> NDArray:
-    """Linear inside a regular grid; boundary value held constant outside (clamp-then-linear == nearest extrapolation)."""
-    from scipy.interpolate import RegularGridInterpolator
-    lo = numpy.array([axis.min() for axis in grid_axes])
-    hi = numpy.array([axis.max() for axis in grid_axes])
-    clamped = numpy.clip(query, lo, hi)
-    return RegularGridInterpolator(grid_axes, values, method="linear")(clamped)
+def _fft_gaussian_blur(field: NDArray[numpy.floating], sigma: t.Any, ny: int, nx: int) -> NDArray[numpy.floating]:
+    """Circular (periodic) Gaussian blur via the analytic FT of a Gaussian, over `field`'s last two
+    axes -- reuses the same FFT-multiply pattern `solve_distortion`'s own Poisson solve uses."""
+    xp = get_array_module(field)
+    real_dtype = field.dtype
+    ky = xp.fft.fftfreq(ny).astype(real_dtype)[:, None]
+    kx = xp.fft.fftfreq(nx).astype(real_dtype)[None, :]
+    gaussian_ft = xp.exp(-2 * (xp.pi * sigma) ** 2 * (ky ** 2 + kx ** 2))
+    return xp.real(ifft2(fft2(field, shift=False) * gaussian_ft, shift=False)).astype(real_dtype)
 
 
-def _scattered_linear_nearest(points: NDArray, values: NDArray, query: NDArray) -> NDArray:
-    """Linear inside the convex hull of `points`, nearest-neighbor outside."""
-    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
-    lin = LinearNDInterpolator(points, values, fill_value=numpy.nan)(query)
-    near = NearestNDInterpolator(points, values)(query)
-    nan_mask = numpy.isnan(lin.real) if numpy.iscomplexobj(lin) else numpy.isnan(lin)
-    return numpy.where(nan_mask, near, lin)
+def _scattered_kernel_regression(
+    points: NDArray[numpy.floating],
+    values: NDArray[numpy.floating],
+    grid_shape: t.Tuple[int, int],
+    min_neighbors: int = 6,
+) -> NDArray[numpy.floating]:
+    """Nadaraya-Watson kernel regression of scattered (points, values) onto a regular 0-indexed
+    (y, x) grid, via FFT splat-blur-divide:
+
+        f(x) = sum_i K(x - x_i) v_i / sum_i K(x - x_i),   K = isotropic Gaussian
+
+    Ported from CuPy's `distort.py` `_scattered_kernel_regression` (see that module's docstring
+    for the full derivation/validation) -- replaces a linear-inside-convex-hull/zero-outside fit,
+    whose hard boundary discontinuity rang through the Poisson solve below and damaged the object
+    near the edge of the scanned region. This decays smoothly to zero away from the scan instead.
+
+    Bandwidth is entirely data-driven (no per-dataset tuning constant): sigma is the smallest value
+    such that every point has at least `min_neighbors` other points within one bandwidth of it
+    (`_max_kth_nn_dist`), so every estimate inside the scanned region averages over at least
+    `min_neighbors` independent samples. The same blurred splat denominator doubles as a smooth
+    local-density estimate, giving a decay envelope with no extra computation and no hard cutoff
+    (hence nothing for the Poisson solve to ring on).
+
+    `points` (n,2), (y, x) in the same 0-indexed pixel coordinates as the target grid. `values` is
+    (n,) or (n,k); returns `grid_shape` (or `grid_shape + (k,)`).
+    """
+    xp = get_array_module(points, values)
+    dtype = to_real_dtype(values.dtype)
+    points = points.astype(dtype)
+    trailing = values.shape[1:]
+    values2 = xp.reshape(values, (values.shape[0], -1)).astype(dtype)
+    nchan = values2.shape[1]
+    (ny, nx) = grid_shape
+
+    sigma = xp.maximum(_max_kth_nn_dist(points, min_neighbors), xp.asarray(1e-6, dtype=dtype))
+
+    y0 = xp.floor(points[:, 0]).astype(numpy.int64)
+    x0 = xp.floor(points[:, 1]).astype(numpy.int64)
+    fy = points[:, 0] - y0.astype(dtype)
+    fx = points[:, 1] - x0.astype(dtype)
+    (y0m, y1m) = (y0 % ny, (y0 + 1) % ny)
+    (x0m, x1m) = (x0 % nx, (x0 + 1) % nx)
+
+    # bilinear splat (adjoint of bilinear gather), onto the periodic grid the FFT blur below
+    # already treats this grid as having.
+    corners = (
+        (y0m, x0m, (1 - fy) * (1 - fx)),
+        (y0m, x1m, (1 - fy) * fx),
+        (y1m, x0m, fy * (1 - fx)),
+        (y1m, x1m, fy * fx),
+    )
+
+    den = xp.zeros((ny, nx), dtype=dtype)
+    for (yi, xi, w) in corners:
+        den = den + scatter_add((ny, nx), (yi, xi), w, dtype=dtype)
+
+    num_channels = []
+    for c in range(nchan):
+        chan_grid = xp.zeros((ny, nx), dtype=dtype)
+        for (yi, xi, w) in corners:
+            chan_grid = chan_grid + scatter_add((ny, nx), (yi, xi), w * values2[:, c], dtype=dtype)
+        num_channels.append(chan_grid)
+    num = xp.stack(num_channels, axis=0)  # (nchan, ny, nx)
+
+    num_b = _fft_gaussian_blur(num, sigma, ny, nx)
+    den_b = _fft_gaussian_blur(den, sigma, ny, nx)
+
+    # tau: a small fraction of `min_neighbors` points' worth of the densest sampled location's
+    # own weight -- ties the only remaining constant back to min_neighbors, not a separate tunable.
+    tau = xp.maximum(xp.max(den_b), xp.asarray(1e-300, dtype=dtype)) / (2.0 * min_neighbors)
+    den_safe = den_b + tau
+    envelope = den_b / den_safe
+    result = (num_b / den_safe[None, :, :]) * envelope[None, :, :]
+    result = xp.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+
+    result = xp.moveaxis(result, 0, -1)  # (ny, nx, nchan)
+    return result.reshape((ny, nx) + trailing) if trailing else result[:, :, 0]
+
+
+def _sample_field_at_positions(
+    field: NDArray[numpy.floating], query_yx: NDArray[numpy.floating],
+) -> NDArray[numpy.floating]:
+    """field: (ny,nx) or (ny,nx,k) real array on the object's own 0-indexed pixel grid.
+    query_yx: (n,2) query coordinates in that same grid. Linearly interpolated, with
+    out-of-bounds queries clamped to the nearest valid grid point. Returns (n,) or (n,k)."""
+    xp = get_array_module(field, query_yx)
+    coords = xp.stack([query_yx[:, 0], query_yx[:, 1]])
+    if field.ndim == 2:
+        return map_coordinates(field, coords, order=1, mode='nearest')
+    trailing = field.shape[2:]
+    field2 = xp.reshape(field, (field.shape[0], field.shape[1], -1))
+    out = xp.stack(
+        [map_coordinates(field2[:, :, k], coords, order=1, mode='nearest') for k in range(field2.shape[2])],
+        axis=-1,
+    )
+    return out.reshape((query_yx.shape[0],) + trailing)
+
+
+_PULL_WARP_REFINE_ITERS = 2  # see _pull_warp_object's docstring
+
+
+def _pull_warp_object(
+    obj_data: NDArray[numpy.complexfloating], uy: NDArray[numpy.floating], ux: NDArray[numpy.floating],
+    refine_iters: int = _PULL_WARP_REFINE_ITERS,
+) -> NDArray[numpy.complexfloating]:
+    """Backward/pull warp: obj_new(x) = obj(y(x)), where y solves y + u(y) = x (the true inverse of
+    "the value at y moved to y+u(y)"), via ordinary regular-grid interpolation -- replaces a
+    forward/"push" scatter-and-retriangulate warp, which is only well-posed where the warp stays
+    locally injective and produced real artifacts near sharp object features even for the small,
+    non-folding per-iteration displacements actually seen in production (ported from CuPy's
+    `distort.py` `_pull_warp_object`; see that module's docstring for the full argument).
+
+    y is found by fixed-point iteration, y <- x - u(y), starting from y0 = x - u(x) (exact only as
+    u->0, accurate to O(|grad(u)|^2) -- fine at production's sub-pixel displacements but not for a
+    single larger correction). Each refinement step needs u evaluated at the current estimate y --
+    itself just a regular-grid interpolation, no triangulation, so no folding/holes/degenerate-
+    triangle failure mode is possible regardless of `refine_iters`.
+
+    obj_data: (n_slices, ny, nx) complex. uy, ux: (ny, nx) real displacement field, same grid.
+    """
+    xp = get_array_module(obj_data, uy, ux)
+    (n_slices, ny, nx) = obj_data.shape
+    dtype = uy.dtype
+    (ry0, rx0) = xp.meshgrid(xp.arange(ny, dtype=dtype), xp.arange(nx, dtype=dtype), indexing='ij')
+    (yy, xx) = (ry0 - uy, rx0 - ux)
+    for _ in range(refine_iters):
+        coords_y = xp.stack([yy.ravel(), xx.ravel()])
+        u_at_y_y = map_coordinates(uy, coords_y, order=1, mode='nearest').reshape(ny, nx)
+        u_at_y_x = map_coordinates(ux, coords_y, order=1, mode='nearest').reshape(ny, nx)
+        (yy, xx) = (ry0 - u_at_y_y, rx0 - u_at_y_x)
+
+    coords = xp.stack([yy.ravel(), xx.ravel()])
+    slices = []
+    for k in range(n_slices):
+        real_k = map_coordinates(xp.real(obj_data[k]), coords, order=1, mode='nearest').reshape(ny, nx)
+        imag_k = map_coordinates(xp.imag(obj_data[k]), coords, order=1, mode='nearest').reshape(ny, nx)
+        slices.append(real_k + 1j * imag_k)
+    return xp.stack(slices, axis=0).astype(obj_data.dtype)
 
 
 def solve_distortion(
     scan_idx: NDArray[numpy.floating],
     obj_data: NDArray[numpy.complexfloating],
     delta_eps: NDArray[numpy.floating],
+    min_neighbors: int = 6,
+    refine_iters: int = _PULL_WARP_REFINE_ITERS,
 ) -> t.Tuple[NDArray[numpy.complexfloating], NDArray[numpy.floating]]:
-    """Convert a per-position strain *update* (already scaled to a step size and in
-    descent direction -- NOT the raw loss gradient) into object and position updates.
+    """Convert a per-position strain *update* (already scaled to a step size and in descent
+    direction -- NOT the raw loss gradient) into object and position updates.
 
-    `scan_idx`: (npos, 2) scan positions in the object's own pixel-index space (y, x),
-    i.e. `(scan - sampling.corner) / sampling.sampling`. NOT a windowed cutout.
+    `scan_idx`: (npos, 2) scan positions in the object's own pixel-index space (y, x), i.e.
+    `(scan - sampling.corner) / sampling.sampling`. NOT a windowed cutout.
     `obj_data`: (n_slices, ny, nx) complex object, on the same pixel grid as `scan_idx`.
-    `delta_eps`: (npos, 4) = [eps_xx, eps_xy, eps_yx, eps_yy] step, same channel order
-    as `strain_perturbation`'s `eps`.
+    `delta_eps`: (npos, 4) = [eps_xx, eps_xy, eps_yx, eps_yy] step, same channel order as
+    `strain_perturbation`'s `eps`.
 
     Returns `(new_obj, new_scan_idx)` (new_scan_idx still in pixel-index space).
 
-    Implements straingradient.pdf section 3: scatter the per-position strain onto the
-    object's pixel grid (linear inside the convex hull, zero outside -- since the
-    resulting displacement field must stay continuous), Fourier-invert the discrete
-    Laplacian to get a smooth global displacement field consistent with all the local
-    strain samples, then use that field to shift positions and forward-warp the object.
-    CPU/SciPy only -- no JAX/torch equivalent for the scattered/gridded interpolation.
+    Implements straingradient.pdf section 3: scatter the per-position strain onto the object's
+    pixel grid (`_scattered_kernel_regression`), Fourier-invert the discrete Laplacian to get a
+    smooth global displacement field consistent with all the local strain samples, then use that
+    field to shift positions and backward-warp the object (`_pull_warp_object`). Runs entirely on
+    the active `xp` backend -- see this module's docstring.
     """
-    scan_idx = to_numpy(scan_idx).astype(numpy.float64)
-    obj_data = to_numpy(obj_data)
-    delta_eps = to_numpy(delta_eps).astype(numpy.float64)
+    xp = get_array_module(scan_idx, obj_data, delta_eps)
+    dtype = to_real_dtype(obj_data.dtype)
+    scan_idx = scan_idx.astype(dtype)
+    delta_eps = delta_eps.astype(dtype)
 
     (n_slices, ny, nx) = obj_data.shape
-    (ry, rx) = numpy.meshgrid(numpy.arange(ny), numpy.arange(nx), indexing="ij")
-    grid_yx = numpy.stack([ry.ravel(), rx.ravel()], axis=1)
 
     # discrete central-difference derivative operators, as convolution kernels
-    kernel_dy = numpy.zeros((ny, nx))
-    kernel_dy[1, 0] = 0.5
-    kernel_dy[ny - 1, 0] = -0.5
-    kernel_dx = numpy.zeros((ny, nx))
-    kernel_dx[0, 1] = 0.5
-    kernel_dx[0, nx - 1] = -0.5
-    Dy = numpy.fft.fft2(kernel_dy)
-    Dx = numpy.fft.fft2(kernel_dx)
-    L = Dy**2 + Dx**2  # discrete Laplacian's frequency response
+    kernel_dy = at(xp.zeros((ny, nx), dtype=dtype), (1, 0)).set(0.5)
+    kernel_dy = at(kernel_dy, (ny - 1, 0)).set(-0.5)
+    kernel_dx = at(xp.zeros((ny, nx), dtype=dtype), (0, 1)).set(0.5)
+    kernel_dx = at(kernel_dx, (0, nx - 1)).set(-0.5)
+    Dy = fft2(kernel_dy, shift=False)
+    Dx = fft2(kernel_dx, shift=False)
+    L = Dy ** 2 + Dx ** 2  # discrete Laplacian's frequency response
 
-    # frequencies the Laplacian can't sample (DC + Nyquist-like points): these are
-    # unrealistically high/low frequencies for a real displacement field, zero them.
-    zero_mask = numpy.abs(L) < 1e-10
-    L_safe = numpy.where(zero_mask, 1.0, L)
+    # frequencies the Laplacian can't sample (DC + Nyquist-like points): unrealistically
+    # high/low frequencies for a real displacement field -- zero them.
+    zero_mask = xp.abs(L) < 1e-10
+    L_safe = xp.where(zero_mask, 1.0, L)
 
-    re = _scattered_linear_zero_fill(scan_idx, delta_eps, grid_yx).reshape(ny, nx, 4)
+    # scattered strain samples -> smooth grid, [eps_xx, eps_xy, eps_yx, eps_yy] channel order
+    # (matching strain_perturbation's `eps`).
+    re = _scattered_kernel_regression(scan_idx, delta_eps, (ny, nx), min_neighbors=min_neighbors)
 
     # eq. 5: u_i = ifft[ (1/L) * sum_j fft[D_j] * fft[eps_ij] ], i,j in {x, y}
-    Ux_f = (Dx * numpy.fft.fft2(re[:, :, 0]) + Dy * numpy.fft.fft2(re[:, :, 1])) / L_safe
-    Uy_f = (Dx * numpy.fft.fft2(re[:, :, 2]) + Dy * numpy.fft.fft2(re[:, :, 3])) / L_safe
-    Ux_f = numpy.where(zero_mask, 0, Ux_f)
-    Uy_f = numpy.where(zero_mask, 0, Uy_f)
+    Ux_f = (Dx * fft2(re[:, :, 0], shift=False) + Dy * fft2(re[:, :, 1], shift=False)) / L_safe
+    Uy_f = (Dx * fft2(re[:, :, 2], shift=False) + Dy * fft2(re[:, :, 3], shift=False)) / L_safe
+    Ux_f = xp.where(zero_mask, 0, Ux_f)
+    Uy_f = xp.where(zero_mask, 0, Uy_f)
 
-    ux = numpy.real(numpy.fft.ifft2(Ux_f))  # col (x) displacement, pixel units
-    uy = numpy.real(numpy.fft.ifft2(Uy_f))  # row (y) displacement, pixel units
+    ux = xp.real(ifft2(Ux_f, shift=False))  # col (x) displacement, pixel units
+    uy = xp.real(ifft2(Uy_f, shift=False))  # row (y) displacement, pixel units
 
     # position update: x_new = x_old + u_interp(x_old)
-    y_axis = numpy.arange(ny, dtype=numpy.float64)
-    x_axis = numpy.arange(nx, dtype=numpy.float64)
-    disp_at_pos = _gridded_linear_nearest_extrap((y_axis, x_axis), numpy.stack([uy, ux], axis=2), scan_idx)
-    new_scan_idx = (scan_idx + disp_at_pos).astype(numpy.float32)
+    disp_at_pos = _sample_field_at_positions(xp.stack([uy, ux], axis=-1), scan_idx)
+    new_scan_idx = (scan_idx + disp_at_pos).astype(dtype)
 
-    # object update: O_new(x + u) = O_old(x) -> interpolate O_old at (x + u), evaluate at x
-    warped_yx = numpy.stack([(ry + uy).ravel(), (rx + ux).ravel()], axis=1)
-    obj_flat = obj_data.transpose(1, 2, 0).reshape(ny * nx, n_slices)
-    new_re = _scattered_linear_nearest(warped_yx, obj_flat.real, grid_yx)
-    new_im = _scattered_linear_nearest(warped_yx, obj_flat.imag, grid_yx)
-    new_obj = (new_re + 1j * new_im).reshape(ny, nx, n_slices).transpose(2, 0, 1).astype(obj_data.dtype)
+    new_obj = _pull_warp_object(obj_data, uy, ux, refine_iters=refine_iters).astype(obj_data.dtype)
 
     return new_obj, new_scan_idx
 
@@ -207,6 +363,8 @@ class StrainDistortionSolverProps(Dataclass):
     max_step_size: t.Optional[float] = None
     """Maximum per-position strain-update magnitude, soft-clipped (see `phaser.utils.num.brake`)
     before the Poisson solve."""
+    min_neighbors: int = 6
+    """Data-driven kernel-regression bandwidth target -- see `_scattered_kernel_regression`."""
 
 
 class StrainDistortionSolver(GradientSolver[None]):
@@ -227,6 +385,7 @@ class StrainDistortionSolver(GradientSolver[None]):
             )
         self.step_size = props.step_size
         self.max_step_size = props.max_step_size
+        self.min_neighbors = props.min_neighbors
 
     def init_state(self, sim: 'ReconsState') -> None:
         return None
@@ -237,8 +396,6 @@ class StrainDistortionSolver(GradientSolver[None]):
     def update(
         self, sim: 'ReconsState', state: None, grad: t.Dict[str, NDArray[numpy.floating]], loss: float,
     ) -> t.Tuple[t.Dict[str, t.Any], None]:
-        xp = get_array_module(grad['distortion'])
-
         # grad['distortion'] is already the descent direction (tree.grad's sign=-1),
         # not the raw dLoss/deps -- scale directly, don't negate again.
         delta_eps = self.step_size * grad['distortion']
@@ -247,12 +404,14 @@ class StrainDistortionSolver(GradientSolver[None]):
 
         corner = sim.object.sampling.corner
         sampling = sim.object.sampling.sampling
-        scan_idx = (to_numpy(sim.scan) - corner) / sampling
+        scan_idx = (sim.scan - corner) / sampling
 
-        (new_obj, new_scan_idx) = solve_distortion(scan_idx, to_numpy(sim.object.data), to_numpy(delta_eps))
+        (new_obj, new_scan_idx) = solve_distortion(
+            scan_idx, sim.object.data, delta_eps, min_neighbors=self.min_neighbors,
+        )
 
         new_scan = new_scan_idx * sampling + corner
-        object_delta = xp.asarray(new_obj - to_numpy(sim.object.data), dtype=sim.object.data.dtype)
-        positions_delta = xp.asarray(new_scan - to_numpy(sim.scan), dtype=sim.scan.dtype)
+        object_delta = (new_obj - sim.object.data).astype(sim.object.data.dtype)
+        positions_delta = (new_scan - sim.scan).astype(sim.scan.dtype)
 
         return ({'object': object_delta, 'positions': positions_delta}, state)
