@@ -170,9 +170,18 @@ def apply_update(state: ReconsState, update: t.Dict[ReconsVar, numpy.ndarray]) -
     if 'propagator_mu' in update:
         state.propagator_mu += update['propagator_mu']
     if 'positions' in update:
-        # subtract mean position update
-        xp = get_array_module(update['positions'])
-        update['positions'] -= xp.mean(update['positions'], tuple(range(update['positions'].ndim - 1)))
+        if 'object' not in update:
+            # Subtract mean position update -- gauge-fixes the plain per-position gradient
+            # solver's otherwise-unconstrained global translation freedom. Only applies to a
+            # standalone positions update: the strain-distortion solver's positions delta is
+            # produced together with a correlated object delta from the same Poisson-solved
+            # displacement field (see `StrainDistortionSolver.update`/`solve_distortion`), which
+            # already fixes its own gauge freedom (`solve_distortion`'s `zero_mask` zeros the
+            # field's DC component) -- re-subtracting the mean here would decouple the position
+            # shift from the object warp it's paired with, unlike the CuPy reference
+            # implementation's `distort()`, which applies no such post-hoc correction to `sd`.
+            xp = get_array_module(update['positions'])
+            update['positions'] -= xp.mean(update['positions'], tuple(range(update['positions'].ndim - 1)))
 
         state.scan += update['positions']
 

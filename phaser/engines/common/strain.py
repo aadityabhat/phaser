@@ -40,7 +40,7 @@ import numpy
 from numpy.typing import NDArray
 
 from phaser.types import Dataclass
-from phaser.utils.num import brake, get_array_module, to_real_dtype, at, scatter_add, fft2, ifft2
+from phaser.utils.num import brake, invavg, get_array_module, to_real_dtype, at, scatter_add, fft2, ifft2
 from phaser.utils.image import map_coordinates
 from phaser.hooks.solver import GradientSolver, GradientSolverArgs
 
@@ -359,15 +359,44 @@ def solve_distortion(
 
 class StrainDistortionSolverProps(Dataclass):
     step_size: float = 1e-2
-    """Fraction of the strain gradient to convert into a displacement-producing update."""
+    """Target update magnitude: the raw strain gradient is rescaled by `step_size / invavg(grad)`
+    (see `phaser.utils.num.invavg`) before braking, so the applied step tracks this scale
+    regardless of the gradient's own magnitude -- a direct port of the CuPy reference
+    implementation's `df = dm / invavg(d['d'])` normalization (`python/ptycho/optimize.py`)."""
     max_step_size: t.Optional[float] = None
     """Maximum per-position strain-update magnitude, soft-clipped (see `phaser.utils.num.brake`)
     before the Poisson solve."""
     min_neighbors: int = 6
     """Data-driven kernel-regression bandwidth target -- see `_scattered_kernel_regression`."""
+    decay_half_life: t.Optional[float] = 1000.0
+    """`step_size` is scaled by `0.5 ** (total_iter / decay_half_life)` each iteration
+    (`total_iter` = `sim.iter.total_iter`, resume-aware), before the `invavg` normalization
+    above. `None` disables the decay (flat `step_size`). Direct port of CuPy's
+    `0.5 ** (i / 1000)` factor on `df_raw` (`python/ptycho/optimize.py`)."""
+    warmup_freeze_gate_iter: t.Optional[int] = 250
+    """Once `sim.iter.total_iter` exceeds this, the per-iteration (decayed, invavg-normalized)
+    step is replaced by a running average of its own raw value, accumulated over the next
+    `warmup_freeze_iters` iterations, then frozen at that average for every iteration after --
+    plain fixed-step descent from there on. `None` disables freezing (the decayed,
+    per-iteration-normalized step is used every iteration, matching a fresh reconstruction's
+    very first `warmup_freeze_gate_iter` iterations regardless of this setting). Direct port of
+    CuPy's `SCAN_STEP_WARMUP_ITERS`/`i > 250` gate on `df` (`python/ptycho/optimize.py`); see that
+    module's docstring for the full motivation (the per-iteration signal was found too small/noisy
+    near an already-converged checkpoint to show clean accumulation without this -- memory:
+    12slice-divergence-ablation-20260914). Not resume-safe by design, matching CuPy: the running
+    average itself always restarts from scratch (`init_state`), even if `total_iter` resumes
+    partway through what would have been its own warmup window."""
+    warmup_freeze_iters: int = 100
+    """See `warmup_freeze_gate_iter`."""
 
 
-class StrainDistortionSolver(GradientSolver[None]):
+class _StrainStepState(t.NamedTuple):
+    warmup_sum: float = 0.0
+    warmup_count: int = 0
+    frozen: t.Optional[float] = None
+
+
+class StrainDistortionSolver(GradientSolver[_StrainStepState]):
     """Consumes the per-position strain gradient (see `strain_perturbation`) and produces
     coupled `{'object', 'positions'}` updates via `solve_distortion`. Must be used as a
     per-iteration solver keyed on `{'distortion'}` (see `_PER_ITER_VARS` in
@@ -386,19 +415,50 @@ class StrainDistortionSolver(GradientSolver[None]):
         self.step_size = props.step_size
         self.max_step_size = props.max_step_size
         self.min_neighbors = props.min_neighbors
+        self.decay_half_life = props.decay_half_life
+        self.warmup_freeze_gate_iter = props.warmup_freeze_gate_iter
+        self.warmup_freeze_iters = props.warmup_freeze_iters
 
-    def init_state(self, sim: 'ReconsState') -> None:
-        return None
+    def init_state(self, sim: 'ReconsState') -> _StrainStepState:
+        return _StrainStepState()
 
-    def update_for_iter(self, sim: 'ReconsState', state: None, niter: int) -> None:
+    def update_for_iter(self, sim: 'ReconsState', state: _StrainStepState, niter: int) -> _StrainStepState:
         return state
 
     def update(
-        self, sim: 'ReconsState', state: None, grad: t.Dict[str, NDArray[numpy.floating]], loss: float,
-    ) -> t.Tuple[t.Dict[str, t.Any], None]:
+        self, sim: 'ReconsState', state: _StrainStepState, grad: t.Dict[str, NDArray[numpy.floating]], loss: float,
+    ) -> t.Tuple[t.Dict[str, t.Any], _StrainStepState]:
         # grad['distortion'] is already the descent direction (tree.grad's sign=-1),
         # not the raw dLoss/deps -- scale directly, don't negate again.
-        delta_eps = self.step_size * grad['distortion']
+        raw_grad = grad['distortion']
+        xp = get_array_module(raw_grad)
+        total_iter = int(sim.iter.total_iter)
+
+        decay = 1.0 if self.decay_half_life is None else 0.5 ** (total_iter / self.decay_half_life)
+        # xp.maximum(..., eps) guards a still-zero gradient (e.g. distortion's very first
+        # active iteration), where invavg's own sum(|.|)/sum(|.|^2) would otherwise be 0/0.
+        raw_step_scale = float(decay * self.step_size / xp.maximum(invavg(raw_grad), 1e-30))
+
+        if total_iter <= 1:
+            # No prior gradient history yet on a fresh reconstruction's very first iteration --
+            # skip the distortion update entirely rather than normalize off a single, possibly
+            # degenerate sample (matches CuPy's `always_apply_dsdf or i > 1` gate; every real
+            # caller there passes `always_apply_dsdf=False` for a fresh run and starts resumes
+            # past iteration 1, so this is the gate's whole effective behavior).
+            step_scale = 0.0
+        elif self.warmup_freeze_gate_iter is not None and total_iter > self.warmup_freeze_gate_iter:
+            if state.frozen is not None:
+                step_scale = state.frozen
+            else:
+                warmup_sum = state.warmup_sum + raw_step_scale
+                warmup_count = state.warmup_count + 1
+                step_scale = warmup_sum / warmup_count
+                frozen = step_scale if warmup_count >= self.warmup_freeze_iters else None
+                state = _StrainStepState(warmup_sum, warmup_count, frozen)
+        else:
+            step_scale = raw_step_scale
+
+        delta_eps = step_scale * raw_grad
         if self.max_step_size is not None:
             delta_eps = brake(delta_eps, self.max_step_size)
 

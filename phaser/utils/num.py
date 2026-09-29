@@ -834,6 +834,18 @@ def brake(update: NDArray[numpy.floating], max_magnitude: float, *, axis: int = 
     return xp.where(xp.isfinite(result), result, xp.zeros_like(update))
 
 
+def invavg(arr: NDArray[numpy.inexact]) -> float:
+    """sum(|arr|^2) / sum(|arr|) -- a magnitude-weighted average used to normalize a raw
+    gradient into a step of some target scale (`target / invavg(grad)`), so that step scales
+    down automatically as the gradient's own magnitude grows or shrinks.
+
+    Ported from the CuPy reference implementation's `invavg()` (`python/ptycho/common.py`).
+    """
+    xp = get_array_module(arr)
+    mag = xp.abs(arr)
+    return xp.sum(abs2(mag)) / xp.sum(mag)
+
+
 @tree_dataclass(frozen=True, init=False, drop_fields=('extent',))
 class Sampling:
     shape: NDArray[numpy.int_]
@@ -1147,6 +1159,6 @@ __all__ = [
     'to_complex_dtype', 'to_real_dtype',
     'fft2', 'ifft2', 'fft2shift', 'ifft2shift',
     'abs2', 'split_array', 'unstack',
-    'at', 'scatter_add', 'ufunc_outer', 'check_finite', 'brake',
+    'at', 'scatter_add', 'ufunc_outer', 'check_finite', 'brake', 'invavg',
     'Sampling', 'IndexLike',
 ]

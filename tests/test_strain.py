@@ -23,11 +23,13 @@ from phaser.utils.object import ObjectSampling
 from phaser.state import ObjectState, ProbeState, ReconsState, IterState
 from phaser.plan import AmplitudeNoisePlan
 from phaser.engines.common.noise_models import AmplitudeNoiseModel
-from phaser.engines.gradient.run import run_model, SolverStates
+from phaser.engines.gradient.run import run_model, SolverStates, apply_update
 from phaser.engines.common.strain import (
     StrainDistortionSolver, StrainDistortionSolverProps, strain_perturbation, _scattered_kernel_regression,
+    solve_distortion,
 )
 from phaser.engines.common.simulation import make_propagators
+from phaser.utils.num import invavg
 import phaser.utils.tree as tree
 
 
@@ -133,6 +135,11 @@ def test_strain_solver_decreases_loss_end_to_end():
     the loss -- exercises the Fourier-Laplacian inversion and interpolation, not just the
     eps-gradient extraction covered by the other tests."""
     (state, patterns, mask, noise_model, solver_states, group, npos) = _make_toy_problem()
+    # total_iter must be > 1 for the solver to apply a nonzero step at all -- see
+    # test_strain_step_schedule_skips_first_iteration -- and <= 250 (the default
+    # warmup_freeze_gate_iter) to exercise the plain decayed/normalized step, not the
+    # running-average-then-freeze path (covered separately).
+    state.iter.total_iter = 5
 
     def loss_fn(eps):
         return _loss(state, patterns, mask, noise_model, solver_states, group, {'distortion': eps})
@@ -142,7 +149,7 @@ def test_strain_solver_decreases_loss_end_to_end():
     descent_grad = tree.grad(loss_fn, xp=jnp, sign=-1)(eps0)
 
     solver = StrainDistortionSolver({'plan': None, 'params': frozenset({'distortion'})}, StrainDistortionSolverProps(step_size=0.5))
-    (update, _) = solver.update(state, None, {'distortion': descent_grad}, loss0)
+    (update, _) = solver.update(state, solver.init_state(state), {'distortion': descent_grad}, loss0)
 
     assert numpy.all(numpy.isfinite(numpy.asarray(update['object'])))
     assert numpy.all(numpy.isfinite(numpy.asarray(update['positions'])))
@@ -155,6 +162,140 @@ def test_strain_solver_decreases_loss_end_to_end():
 
     loss_after = float(_loss(new_state, patterns, mask, noise_model, solver_states, group, {}))
     assert loss_after < loss0
+
+
+def test_apply_update_subtracts_mean_for_standalone_positions():
+    """`apply_update`'s translation gauge-fixing (subtracting the mean position update) is
+    meant for a plain per-position gradient solver (e.g. Adam/SGD on 'positions' alone),
+    which has no other way to pin down the reconstruction's otherwise-unconstrained global
+    translation. A standalone {'positions': ...} update (no paired 'object' delta) should
+    have this applied."""
+    (state, _patterns, _mask, _noise_model, _solver_states, _group, npos) = _make_toy_problem()
+    delta = jnp.array(numpy.random.default_rng(0).normal(size=(npos, 2)))
+    scan_before = numpy.array(state.scan)
+
+    new_state = apply_update(state, {'positions': delta})
+    applied = numpy.asarray(new_state.scan) - scan_before
+
+    numpy.testing.assert_allclose(numpy.mean(applied, axis=0), 0.0, atol=1e-10)
+    assert not numpy.allclose(applied, numpy.asarray(delta))
+
+
+def test_apply_update_preserves_strain_distortion_positions_mean():
+    """Regression test: `apply_update` used to unconditionally mean-subtract every
+    {'positions': ...} update, including `StrainDistortionSolver`'s -- but that update is
+    produced together with a correlated 'object' delta from the same Poisson-solved
+    displacement field (see `StrainDistortionSolver.update`/`solve_distortion`), which
+    already fixes its own gauge freedom (`solve_distortion`'s `zero_mask` zeros the field's
+    DC component). Re-subtracting the mean here decoupled the position shift from the object
+    warp it's paired with -- the CuPy reference implementation's `distort()` applies no such
+    post-hoc correction to `sd`. A coupled {'object', 'positions'} update should pass the
+    positions delta through unchanged."""
+    (state, _patterns, _mask, _noise_model, _solver_states, _group, npos) = _make_toy_problem()
+    delta_pos = jnp.array(numpy.random.default_rng(1).normal(size=(npos, 2)))
+    delta_obj = jnp.zeros_like(state.object.data)
+    scan_before = numpy.array(state.scan)
+
+    new_state = apply_update(state, {'object': delta_obj, 'positions': delta_pos})
+    applied = numpy.asarray(new_state.scan) - scan_before
+
+    numpy.testing.assert_allclose(applied, numpy.asarray(delta_pos), atol=1e-10)
+
+
+def _unit_positions_delta(state, raw_grad, min_neighbors=6):
+    """`solve_distortion`'s position update at step_scale=1 -- since the kernel regression,
+    Poisson solve, and position sampling are all linear in `delta_eps` (only the object's
+    pull-warp is not), `StrainDistortionSolver`'s actual positions_delta at any step_scale
+    should equal `step_scale * this`."""
+    corner = state.object.sampling.corner
+    sampling = state.object.sampling.sampling
+    scan_idx = (state.scan - corner) / sampling
+    (_, new_scan_idx) = solve_distortion(scan_idx, state.object.data, raw_grad, min_neighbors=min_neighbors)
+    new_scan = new_scan_idx * sampling + corner
+    return numpy.asarray(new_scan - state.scan)
+
+
+def test_strain_step_schedule_skips_first_iteration():
+    """Ported from CuPy's `always_apply_dsdf or i > 1` gate (`python/ptycho/optimize.py`): a
+    fresh reconstruction's very first iteration has no prior gradient history, so the solver
+    should apply no update at all, rather than normalize off a single, possibly degenerate
+    sample."""
+    (state, patterns, mask, noise_model, solver_states, group, npos) = _make_toy_problem()
+    state.iter.total_iter = 1
+
+    def loss_fn(eps):
+        return _loss(state, patterns, mask, noise_model, solver_states, group, {'distortion': eps})
+
+    descent_grad = tree.grad(loss_fn, xp=jnp, sign=-1)(jnp.zeros((npos, 4)))
+    solver = StrainDistortionSolver({'plan': None, 'params': frozenset({'distortion'})}, StrainDistortionSolverProps(step_size=0.5))
+    (update, _) = solver.update(state, solver.init_state(state), {'distortion': descent_grad}, 0.0)
+
+    numpy.testing.assert_allclose(numpy.asarray(update['object']), 0.0, atol=1e-12)
+    numpy.testing.assert_allclose(numpy.asarray(update['positions']), 0.0, atol=1e-9)
+
+
+def test_strain_step_schedule_decays_with_iteration():
+    """Ported from CuPy's `0.5 ** (i / 1000)` decay on `df_raw` (`python/ptycho/optimize.py`):
+    the step size at total_iter=1002 should be half of total_iter=2's (both well clear of the
+    default warmup_freeze_gate_iter=250, so disable freezing here to isolate the decay)."""
+    (state, patterns, mask, noise_model, solver_states, group, npos) = _make_toy_problem()
+
+    def loss_fn(eps):
+        return _loss(state, patterns, mask, noise_model, solver_states, group, {'distortion': eps})
+
+    descent_grad = tree.grad(loss_fn, xp=jnp, sign=-1)(jnp.zeros((npos, 4)))
+    props = StrainDistortionSolverProps(step_size=0.5, warmup_freeze_gate_iter=None, decay_half_life=1000.0)
+    solver = StrainDistortionSolver({'plan': None, 'params': frozenset({'distortion'})}, props)
+
+    state.iter.total_iter = 2
+    (update_early, _) = solver.update(state, solver.init_state(state), {'distortion': descent_grad}, 0.0)
+    state.iter.total_iter = 1002
+    (update_late, _) = solver.update(state, solver.init_state(state), {'distortion': descent_grad}, 0.0)
+
+    ratio = numpy.linalg.norm(numpy.asarray(update_late['positions'])) / numpy.linalg.norm(numpy.asarray(update_early['positions']))
+    numpy.testing.assert_allclose(ratio, 0.5, rtol=0.02)
+
+
+def test_strain_step_schedule_warmup_then_freezes():
+    """Ported from CuPy's SCAN_STEP_WARMUP_ITERS/`i > 250` gate (`python/ptycho/optimize.py`):
+    past `warmup_freeze_gate_iter`, the step size is the running average of its own raw
+    (decayed, invavg-normalized) value over the next `warmup_freeze_iters` iterations, then
+    frozen at that average -- plain fixed-step descent from there on, even as the (disabled-
+    after-freeze) decay would otherwise keep shrinking it."""
+    (state, patterns, mask, noise_model, solver_states, group, npos) = _make_toy_problem()
+
+    def loss_fn(eps):
+        return _loss(state, patterns, mask, noise_model, solver_states, group, {'distortion': eps})
+
+    descent_grad = tree.grad(loss_fn, xp=jnp, sign=-1)(jnp.zeros((npos, 4)))
+    props = StrainDistortionSolverProps(
+        step_size=0.5, decay_half_life=10.0, warmup_freeze_gate_iter=3, warmup_freeze_iters=3,
+    )
+    solver = StrainDistortionSolver({'plan': None, 'params': frozenset({'distortion'})}, props)
+    solver_state = solver.init_state(state)
+    unit_delta = _unit_positions_delta(state, descent_grad)
+    denom = float(invavg(numpy.asarray(descent_grad)))
+
+    expected_running_avg = 0.0
+    frozen_expected = None
+    for (k, total_iter) in enumerate((4, 5, 6, 7, 8), start=1):
+        state.iter.total_iter = total_iter
+        (update, solver_state) = solver.update(state, solver_state, {'distortion': descent_grad}, 0.0)
+
+        if frozen_expected is None:
+            raw = props.step_size * 0.5 ** (total_iter / props.decay_half_life) / denom
+            expected_running_avg = (expected_running_avg * (k - 1) + raw) / k
+            expected_step_scale = expected_running_avg
+            if k >= props.warmup_freeze_iters:
+                frozen_expected = expected_step_scale
+        else:
+            expected_step_scale = frozen_expected
+
+        numpy.testing.assert_allclose(
+            numpy.asarray(update['positions']), expected_step_scale * unit_delta, atol=1e-10, rtol=1e-5,
+        )
+
+    assert solver_state.frozen == pytest.approx(frozen_expected)
 
 
 def test_strain_perturbation_preserves_object_dtype():
